@@ -16,18 +16,11 @@ export async function generatePickList(
   }
 ) {
   try {
-    let orders = await fetchAllUnfulfilledOrders(admin);
+    const orders = await fetchAllUnfulfilledOrders(admin, {
+      startDate: options?.startDate,
+      endDate: options?.endDate,
+    });
     console.log(`Found ${orders.length} unfulfilled orders`);
-
-    // Filter orders by date range BEFORE aggregation so quantities are correct
-    if (options?.startDate || options?.endDate) {
-      orders = filterOrdersByDateRange(
-        orders,
-        options.startDate,
-        options.endDate
-      );
-      console.log(`${orders.length} orders remain after date range filter`);
-    }
 
     const pickList = processOrders(orders);
     return sortPickList(pickList, options?.sortBy || "alpha");
@@ -37,45 +30,42 @@ export async function generatePickList(
   }
 }
 
-function filterOrdersByDateRange(
-  orders: any[],
-  startDate?: string,
-  endDate?: string
-): any[] {
-  return orders.filter((order) => {
-    const orderDate = new Date(order.createdAt);
-
-    if (startDate) {
-      const start = new Date(startDate);
-      start.setHours(0, 0, 0, 0);
-      if (orderDate < start) return false;
-    }
-
-    if (endDate) {
-      const end = new Date(endDate);
-      end.setHours(23, 59, 59, 999);
-      if (orderDate > end) return false;
-    }
-
-    return true;
-  });
-}
-
-async function fetchAllUnfulfilledOrders(admin: AdminApiContext) {
+async function fetchAllUnfulfilledOrders(
+  admin: AdminApiContext,
+  options?: {
+    startDate?: string;
+    endDate?: string;
+  }
+) {
   let allOrders: any[] = [];
   let hasNextPage = true;
   let cursor: string | null = null;
+
+  // Build the query string with date range filters applied at the API level
+  const queryParts = ["fulfillment_status:unshipped"];
+  if (options?.startDate) {
+    queryParts.push(`created_at:>=${options.startDate}`);
+  }
+  if (options?.endDate) {
+    // Add one day to make end date inclusive (created_at:< next day)
+    const endDateObj = new Date(options.endDate + "T00:00:00Z");
+    endDateObj.setUTCDate(endDateObj.getUTCDate() + 1);
+    const nextDay = endDateObj.toISOString().split("T")[0];
+    queryParts.push(`created_at:<${nextDay}`);
+  }
+  const queryString = queryParts.join(" ");
+  console.log("Shopify orders query:", queryString);
 
   while (hasNextPage) {
     console.log("Fetching orders with cursor:", cursor);
     
     const response: any = await admin.graphql(
       `#graphql
-      query GetUnfulfilledOrders($cursor: String) {
+      query GetUnfulfilledOrders($cursor: String, $query: String!) {
         orders(
           first: 250,
           after: $cursor,
-          query: "fulfillment_status:unshipped"
+          query: $query
         ) {
           pageInfo {
             hasNextPage
@@ -112,7 +102,7 @@ async function fetchAllUnfulfilledOrders(admin: AdminApiContext) {
         }
       }`,
       {
-        variables: { cursor },
+        variables: { cursor, query: queryString },
       }
     );
 
