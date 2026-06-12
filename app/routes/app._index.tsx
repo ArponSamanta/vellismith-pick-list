@@ -17,25 +17,31 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin } = await authenticate.admin(request);
 
-  const { generatePickList, formatPickListAsText, filterByDateRange, filterByProductName } = await import("../utils/picklist.server");
+  const { generatePickList, formatPickListAsText, filterByProductName } = await import("../utils/picklist.server");
 
   try {
     const formData = await request.formData();
     const startDate = formData.get("startDate") as string | null;
     const endDate = formData.get("endDate") as string | null;
     const searchKeyword = formData.get("searchKeyword") as string | null;
+    const sortBy = (formData.get("sortBy") as string | null) || "alpha";
+    const showSku = formData.get("showSku") !== "false";
+    const showVariantQuantity = formData.get("showVariantQuantity") !== "false";
 
-    let pickList = await generatePickList(admin);
-
-    if (startDate || endDate) {
-      pickList = filterByDateRange(pickList, startDate || undefined, endDate || undefined);
-    }
+    let pickList = await generatePickList(admin, {
+      startDate: startDate || undefined,
+      endDate: endDate || undefined,
+      sortBy: sortBy as any,
+    });
 
     if (searchKeyword) {
       pickList = filterByProductName(pickList, searchKeyword);
     }
 
-    const formattedText = formatPickListAsText(pickList);
+    const formattedText = formatPickListAsText(pickList, {
+      showSku,
+      showVariantQuantity,
+    });
 
     return {
       pickList,
@@ -62,6 +68,9 @@ export default function Index() {
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [searchKeyword, setSearchKeyword] = useState("");
+  const [sortBy, setSortBy] = useState("alpha");
+  const [showSku, setShowSku] = useState(true);
+  const [showVariantQuantity, setShowVariantQuantity] = useState(true);
   const [showFilters, setShowFilters] = useState(false);
 
   const isLoading =
@@ -77,6 +86,9 @@ export default function Index() {
     if (startDate) formData.append("startDate", startDate);
     if (endDate) formData.append("endDate", endDate);
     if (searchKeyword) formData.append("searchKeyword", searchKeyword);
+    formData.append("sortBy", sortBy);
+    formData.append("showSku", String(showSku));
+    formData.append("showVariantQuantity", String(showVariantQuantity));
     fetcher.submit(formData, { method: "POST" });
   };
 
@@ -84,6 +96,9 @@ export default function Index() {
     setStartDate("");
     setEndDate("");
     setSearchKeyword("");
+    setSortBy("alpha");
+    setShowSku(true);
+    setShowVariantQuantity(true);
   };
 
   const handlePrint = () => {
@@ -99,9 +114,11 @@ export default function Index() {
           <img src="${product.productImage?.url || ''}" alt="${product.productImage?.altText || product.productTitle}"
                style="width: 100%; height: 150px; object-fit: cover; border-radius: 4px; margin-bottom: 8px;" />
           <div style="font-weight: bold; margin-bottom: 8px; font-size: 13px;">${product.productTitle}</div>
+          ${showVariantQuantity ? `
           <div style="font-size: 0.85em; margin-bottom: 4px; line-height: 1.3;">
-            ${product.variants.map((v: any) => `${v.variantTitle}${v.sku ? ' (' + v.sku + ')' : ''}: ${v.quantity}`).join("<br />")}
+            ${product.variants.map((v: any) => `${v.variantTitle}${showSku && v.sku ? ' (' + v.sku + ')' : ''}: ${v.quantity}`).join("<br />")}
           </div>
+          ` : ''}
           <div style="background: #fffacd; padding: 8px; border-radius: 4px; font-size: 16px; font-weight: bold; text-align: center;">
             ${product.totalQuantity}
           </div>
@@ -265,7 +282,7 @@ export default function Index() {
   };
 
   const filterPanel: React.CSSProperties = {
-    maxHeight: showFilters ? "500px" : "0px",
+    maxHeight: showFilters ? "600px" : "0px",
     opacity: showFilters ? 1 : 0,
     overflow: "hidden",
     transition: "all 300ms ease-in-out",
@@ -287,6 +304,29 @@ export default function Index() {
     display: "inline-block",
     transition: "transform 300ms ease-in-out",
     transform: showFilters ? "rotate(180deg)" : "rotate(0deg)",
+  };
+
+  const checkboxLabel: React.CSSProperties = {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    fontSize: "14px",
+    fontWeight: "500",
+    cursor: "pointer",
+    userSelect: "none",
+    color: "var(--s-color-text)",
+  };
+
+  const selectStyle: React.CSSProperties = {
+    padding: "8px 12px",
+    border: "1px solid var(--s-color-border)",
+    borderRadius: "6px",
+    fontSize: "14px",
+    fontFamily: "inherit",
+    transition: "all 200ms ease-in-out",
+    backgroundColor: "var(--s-color-bg)",
+    cursor: "pointer",
+    minWidth: "180px",
   };
 
   return (
@@ -339,6 +379,23 @@ export default function Index() {
 
         input[type="date"]:hover {
           border-color: var(--s-color-interactive-hover);
+        }
+
+        select:focus {
+          outline: none;
+          border-color: var(--s-color-interactive);
+          box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.1);
+        }
+
+        select:hover {
+          border-color: var(--s-color-interactive-hover);
+        }
+
+        input[type="checkbox"] {
+          width: 16px;
+          height: 16px;
+          cursor: pointer;
+          accent-color: var(--s-color-interactive);
         }
       `}</style>
 
@@ -393,6 +450,7 @@ export default function Index() {
         {/* Filter Panel */}
         <div style={filterPanel}>
           <form onSubmit={generatePickList} style={filterContent}>
+            {/* Date Range Row */}
             <div>
               <label style={{ display: "block", marginBottom: "6px", fontSize: "13px", fontWeight: "600" }}>
                 Start Date
@@ -421,7 +479,56 @@ export default function Index() {
                 onChange={(e: any) => setSearchKeyword(e.target.value)}
               />
             </div>
-            <div style={{ display: "flex", gap: "8px" }}>
+
+            {/* Sort Dropdown */}
+            <div>
+              <label style={{ display: "block", marginBottom: "6px", fontSize: "13px", fontWeight: "600" }}>
+                Sort By
+              </label>
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value)}
+                style={selectStyle}
+              >
+                <option value="alpha">Alphabetical (A–Z)</option>
+                <option value="old-to-new">Old to New</option>
+                <option value="new-to-old">New to Old</option>
+                <option value="qty-high-to-low">Highest Qty → Lowest</option>
+                <option value="qty-low-to-high">Lowest Qty → Highest</option>
+              </select>
+            </div>
+
+            {/* Display Options - Checkboxes */}
+            <div style={{
+              display: "flex",
+              gap: "20px",
+              flexWrap: "wrap",
+              padding: "8px 0",
+              width: "100%",
+              borderTop: "1px solid var(--s-color-border-subdued)",
+              paddingTop: "16px",
+              marginTop: "4px",
+            }}>
+              <label style={checkboxLabel}>
+                <input
+                  type="checkbox"
+                  checked={showSku}
+                  onChange={(e) => setShowSku(e.target.checked)}
+                />
+                Include SKU
+              </label>
+              <label style={checkboxLabel}>
+                <input
+                  type="checkbox"
+                  checked={showVariantQuantity}
+                  onChange={(e) => setShowVariantQuantity(e.target.checked)}
+                />
+                Include Individual Variant Quantity
+              </label>
+            </div>
+
+            {/* Action Buttons */}
+            <div style={{ display: "flex", gap: "8px", width: "100%" }}>
               <s-button
                 type="submit"
                 {...(isLoading ? { loading: true, disabled: true } : {})}
@@ -506,14 +613,24 @@ export default function Index() {
                         {product.productTitle}
                       </div>
 
-                      <div style={{ fontSize: "0.85em", marginBottom: "12px", opacity: 0.7, lineHeight: "1.4" }}>
-                        {product.variants.map((variant: any, idx: number) => (
-                          <div key={idx}>
-                            {variant.variantTitle}
-                            {variant.sku && ` (${variant.sku})`}: <strong>{variant.quantity}</strong>
-                          </div>
-                        ))}
-                      </div>
+                      {showVariantQuantity && (
+                        <div style={{ fontSize: "0.85em", marginBottom: "12px", opacity: 0.7, lineHeight: "1.4" }}>
+                          {product.variants.map((variant: any, idx: number) => (
+                            <div key={idx}>
+                              {variant.variantTitle}
+                              {showSku && variant.sku && ` (${variant.sku})`}: <strong>{variant.quantity}</strong>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {!showVariantQuantity && showSku && (
+                        <div style={{ fontSize: "0.85em", marginBottom: "12px", opacity: 0.7, lineHeight: "1.4" }}>
+                          {product.variants.map((variant: any, idx: number) => (
+                            variant.sku ? <div key={idx}>SKU: {variant.sku}</div> : null
+                          ))}
+                        </div>
+                      )}
 
                       <div
                         style={{

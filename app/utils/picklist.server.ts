@@ -1,16 +1,64 @@
 import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
 
-export async function generatePickList(admin: AdminApiContext) {
+export type SortBy =
+  | "alpha"
+  | "old-to-new"
+  | "new-to-old"
+  | "qty-high-to-low"
+  | "qty-low-to-high";
+
+export async function generatePickList(
+  admin: AdminApiContext,
+  options?: {
+    startDate?: string;
+    endDate?: string;
+    sortBy?: SortBy;
+  }
+) {
   try {
-    const orders = await fetchAllUnfulfilledOrders(admin);
+    let orders = await fetchAllUnfulfilledOrders(admin);
     console.log(`Found ${orders.length} unfulfilled orders`);
 
+    // Filter orders by date range BEFORE aggregation so quantities are correct
+    if (options?.startDate || options?.endDate) {
+      orders = filterOrdersByDateRange(
+        orders,
+        options.startDate,
+        options.endDate
+      );
+      console.log(`${orders.length} orders remain after date range filter`);
+    }
+
     const pickList = processOrders(orders);
-    return sortPickList(pickList);
+    return sortPickList(pickList, options?.sortBy || "alpha");
   } catch (error) {
     console.error("Error in generatePickList:", error);
     throw error;
   }
+}
+
+function filterOrdersByDateRange(
+  orders: any[],
+  startDate?: string,
+  endDate?: string
+): any[] {
+  return orders.filter((order) => {
+    const orderDate = new Date(order.createdAt);
+
+    if (startDate) {
+      const start = new Date(startDate);
+      start.setHours(0, 0, 0, 0);
+      if (orderDate < start) return false;
+    }
+
+    if (endDate) {
+      const end = new Date(endDate);
+      end.setHours(23, 59, 59, 999);
+      if (orderDate > end) return false;
+    }
+
+    return true;
+  });
 }
 
 async function fetchAllUnfulfilledOrders(admin: AdminApiContext) {
@@ -121,11 +169,20 @@ function processOrders(orders: any[]): any[] {
           productImage: product.featuredImage,
           variants: [],
           totalQuantity: 0,
-          createdAt: order.createdAt,
+          earliestCreatedAt: order.createdAt,
+          latestCreatedAt: order.createdAt,
         });
       }
 
       const productGroup = productMap.get(productKey)!;
+
+      // Track earliest and latest order dates for this product
+      if (new Date(order.createdAt) < new Date(productGroup.earliestCreatedAt)) {
+        productGroup.earliestCreatedAt = order.createdAt;
+      }
+      if (new Date(order.createdAt) > new Date(productGroup.latestCreatedAt)) {
+        productGroup.latestCreatedAt = order.createdAt;
+      }
 
       let variantGroup = productGroup.variants.find(
         (v: any) => v.variantId === variant.id
@@ -149,50 +206,49 @@ function processOrders(orders: any[]): any[] {
   return Array.from(productMap.values());
 }
 
-function sortPickList(pickList: any[]): any[] {
-  return pickList.sort((a, b) => {
-    const nameA = a.productTitle.toLowerCase();
-    const nameB = b.productTitle.toLowerCase();
-
-    if (nameA < nameB) return -1;
-    if (nameA > nameB) return 1;
-
-    a.variants.sort((va: any, vb: any) => {
+function sortPickList(pickList: any[], sortBy: SortBy): any[] {
+  // Always sort variants alphabetically within each product
+  pickList.forEach((product) => {
+    product.variants.sort((va: any, vb: any) => {
       const variantA = va.variantTitle.toLowerCase();
       const variantB = vb.variantTitle.toLowerCase();
       if (variantA < variantB) return -1;
       if (variantA > variantB) return 1;
       return 0;
     });
-
-    return 0;
   });
-}
 
-export function filterByDateRange(
-  pickList: any[],
-  startDate?: string,
-  endDate?: string
-): any[] {
-  if (!startDate && !endDate) return pickList;
+  switch (sortBy) {
+    case "old-to-new":
+      return pickList.sort(
+        (a, b) =>
+          new Date(a.earliestCreatedAt).getTime() -
+          new Date(b.earliestCreatedAt).getTime()
+      );
 
-  return pickList.filter((product) => {
-    const productDate = new Date(product.createdAt);
+    case "new-to-old":
+      return pickList.sort(
+        (a, b) =>
+          new Date(b.latestCreatedAt).getTime() -
+          new Date(a.latestCreatedAt).getTime()
+      );
 
-    if (startDate) {
-      const start = new Date(startDate);
-      start.setHours(0, 0, 0, 0);
-      if (productDate < start) return false;
-    }
+    case "qty-high-to-low":
+      return pickList.sort((a, b) => b.totalQuantity - a.totalQuantity);
 
-    if (endDate) {
-      const end = new Date(endDate);
-      end.setHours(23, 59, 59, 999);
-      if (productDate > end) return false;
-    }
+    case "qty-low-to-high":
+      return pickList.sort((a, b) => a.totalQuantity - b.totalQuantity);
 
-    return true;
-  });
+    case "alpha":
+    default:
+      return pickList.sort((a, b) => {
+        const nameA = a.productTitle.toLowerCase();
+        const nameB = b.productTitle.toLowerCase();
+        if (nameA < nameB) return -1;
+        if (nameA > nameB) return 1;
+        return 0;
+      });
+  }
 }
 
 export function filterByProductName(
@@ -207,7 +263,16 @@ export function filterByProductName(
   );
 }
 
-export function formatPickListAsText(pickList: any[]): string {
+export function formatPickListAsText(
+  pickList: any[],
+  options?: {
+    showSku?: boolean;
+    showVariantQuantity?: boolean;
+  }
+): string {
+  const showSku = options?.showSku ?? true;
+  const showVariantQuantity = options?.showVariantQuantity ?? true;
+
   const header = `
 ========================================
           PICKING LIST - UNFULFILLED
@@ -225,11 +290,14 @@ export function formatPickListAsText(pickList: any[]): string {
 └─────────────────────────────────────┘
 `;
 
-    product.variants.forEach((variant: any) => {
-      body += `\n  Variant: ${variant.variantTitle}${variant.sku ? ` (SKU: ${variant.sku})` : ""}`;
-      body += `\n  Quantity Needed: ${variant.quantity}`;
-      body += "\n" + "-".repeat(50) + "\n";
-    });
+    if (showVariantQuantity) {
+      product.variants.forEach((variant: any) => {
+        const skuPart = showSku && variant.sku ? ` (SKU: ${variant.sku})` : "";
+        body += `\n  Variant: ${variant.variantTitle}${skuPart}`;
+        body += `\n  Quantity Needed: ${variant.quantity}`;
+        body += "\n" + "-".repeat(50) + "\n";
+      });
+    }
   });
 
   const totalItems = pickList.reduce((sum: number, p: any) => sum + p.totalQuantity, 0);

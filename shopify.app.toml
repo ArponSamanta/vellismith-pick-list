@@ -2,7 +2,7 @@
 
 client_id = "3b68b2d646214f65e42d514aeb4397eb"
 name = "Vellismith-pick-list"
-application_url = "https://vellismith.com/"
+application_url = "https://vellismith-pick-list.onrender.com"
 embedded = true
 
 [access_scopes]
@@ -48,5 +48,4 @@ api_version = "2026-07"
 redirect_urls = [ "https://vellismith.com/api/auth" ]
 
 [build]
-include_config_on_deploy = true
 automatically_update_urls_on_dev = true
