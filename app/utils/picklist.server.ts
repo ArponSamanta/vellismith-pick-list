@@ -16,11 +16,30 @@ export async function generatePickList(
   }
 ) {
   try {
-    let orders = await fetchAllUnfulfilledOrders(admin, {
-      startDate: options?.startDate,
-      endDate: options?.endDate,
-    });
-    console.log(`Found ${orders.length} unfulfilled orders from API`);
+    const { orders: allOrders, shopTimezone } = await fetchAllUnfulfilledOrders(admin);
+    console.log(`Found ${allOrders.length} unfulfilled orders from API. Shop Timezone: ${shopTimezone}`);
+
+    let orders = allOrders;
+
+    // Bulletproof JS filtering: Converts order's UTC timestamp exactly to the shop's local YYYY-MM-DD date
+    if (options?.startDate || options?.endDate) {
+      const dateFormatter = new Intl.DateTimeFormat('en-CA', {
+        timeZone: shopTimezone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      });
+
+      orders = orders.filter((order) => {
+        const localOrderDate = dateFormatter.format(new Date(order.createdAt)); // "YYYY-MM-DD"
+        
+        if (options.startDate && localOrderDate < options.startDate) return false;
+        if (options.endDate && localOrderDate > options.endDate) return false;
+        
+        return true;
+      });
+      console.log(`${orders.length} orders remain after local timezone date filter`);
+    }
 
     const pickList = processOrders(orders);
     return sortPickList(pickList, options?.sortBy || "alpha");
@@ -32,41 +51,26 @@ export async function generatePickList(
 
 
 async function fetchAllUnfulfilledOrders(
-  admin: AdminApiContext,
-  options?: {
-    startDate?: string;
-    endDate?: string;
-  }
-) {
+  admin: AdminApiContext
+): Promise<{ orders: any[]; shopTimezone: string }> {
   let allOrders: any[] = [];
   let hasNextPage = true;
   let cursor: string | null = null;
-
-  // Build the query string with date range filters applied at the API level
-  const queryParts = ["fulfillment_status:unshipped"];
-  if (options?.startDate) {
-    queryParts.push(`created_at:>='${options.startDate}'`);
-  }
-  if (options?.endDate) {
-    // Add one day to make end date inclusive (created_at:< next day)
-    const endDateObj = new Date(options.endDate + "T00:00:00Z");
-    endDateObj.setUTCDate(endDateObj.getUTCDate() + 1);
-    const nextDay = endDateObj.toISOString().split("T")[0];
-    queryParts.push(`created_at:<'${nextDay}'`);
-  }
-  const queryString = queryParts.join(" ");
-  console.log("Shopify orders query:", queryString);
+  let shopTimezone = "UTC"; // Default fallback
 
   while (hasNextPage) {
     console.log("Fetching orders with cursor:", cursor);
     
     const response: any = await admin.graphql(
       `#graphql
-      query GetUnfulfilledOrders($cursor: String, $query: String!) {
+      query GetUnfulfilledOrders($cursor: String) {
+        shop {
+          ianaTimezone
+        }
         orders(
           first: 250,
           after: $cursor,
-          query: $query
+          query: "fulfillment_status:unshipped"
         ) {
           pageInfo {
             hasNextPage
@@ -103,12 +107,17 @@ async function fetchAllUnfulfilledOrders(
         }
       }`,
       {
-        variables: { cursor, query: queryString },
+        variables: { cursor },
       }
     );
 
     const data = await response.json();
     console.log("Response data:", JSON.stringify(data, null, 2).substring(0, 500));
+    
+    // Extract timezone from the first page
+    if (data.data?.shop?.ianaTimezone) {
+      shopTimezone = data.data.shop.ianaTimezone;
+    }
     
     if (data.errors) {
       console.error("GraphQL errors:", data.errors);
@@ -127,7 +136,7 @@ async function fetchAllUnfulfilledOrders(
     cursor = ordersData.pageInfo.endCursor;
   }
 
-  return allOrders;
+  return { orders: allOrders, shopTimezone };
 }
 
 function processOrders(orders: any[]): any[] {
