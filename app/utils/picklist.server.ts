@@ -15,7 +15,13 @@ export async function generatePickList(
     sortBy?: SortBy;
   }
 ) {
+  console.log("========== GENERATE PICK LIST ==========");
+  console.log("options:", JSON.stringify(options, null, 2));
   try {
+    console.log("Passing to fetchAllUnfulfilledOrders:", {
+      startDate: options?.startDate,
+      endDate: options?.endDate,
+    });
     let orders = await fetchAllUnfulfilledOrders(admin, {
       startDate: options?.startDate,
       endDate: options?.endDate,
