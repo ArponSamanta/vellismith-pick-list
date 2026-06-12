@@ -16,11 +16,17 @@ export async function generatePickList(
   }
 ) {
   try {
-    const orders = await fetchAllUnfulfilledOrders(admin, {
+    let orders = await fetchAllUnfulfilledOrders(admin, {
       startDate: options?.startDate,
       endDate: options?.endDate,
     });
-    console.log(`Found ${orders.length} unfulfilled orders`);
+    console.log(`Found ${orders.length} unfulfilled orders from API`);
+
+    // In-memory filter as a safeguard for exact bounds and timezone safety
+    if (options?.startDate || options?.endDate) {
+      orders = filterOrdersByDateRange(orders, options.startDate, options.endDate);
+      console.log(`${orders.length} orders remain after strict date range filter`);
+    }
 
     const pickList = processOrders(orders);
     return sortPickList(pickList, options?.sortBy || "alpha");
@@ -28,6 +34,34 @@ export async function generatePickList(
     console.error("Error in generatePickList:", error);
     throw error;
   }
+}
+
+function filterOrdersByDateRange(
+  orders: any[],
+  startDate?: string,
+  endDate?: string
+): any[] {
+  return orders.filter((order) => {
+    // order.createdAt is an ISO 8601 string like "2026-06-12T15:30:00Z"
+    // Using string comparison is bulletproof and avoids JS Date local timezone shifts
+    
+    if (startDate) {
+      // e.g. "2026-06-12T10:00:00Z" >= "2026-06-12" (true)
+      if (order.createdAt < startDate) return false;
+    }
+    
+    if (endDate) {
+      // Add one day to make it strictly less than the next day
+      const endDateObj = new Date(endDate + "T00:00:00Z");
+      endDateObj.setUTCDate(endDateObj.getUTCDate() + 1);
+      const nextDay = endDateObj.toISOString().split("T")[0];
+      
+      // e.g. "2026-06-12T10:00:00Z" < "2026-06-13" (true)
+      if (order.createdAt >= nextDay) return false;
+    }
+
+    return true;
+  });
 }
 
 async function fetchAllUnfulfilledOrders(
@@ -44,16 +78,16 @@ async function fetchAllUnfulfilledOrders(
   // Build the query string with date range filters applied at the API level
   const queryParts = ["fulfillment_status:unshipped"];
   if (options?.startDate) {
-    queryParts.push(`created_at:>=${options.startDate}`);
+    queryParts.push(`created_at:>="${options.startDate}"`);
   }
   if (options?.endDate) {
     // Add one day to make end date inclusive (created_at:< next day)
     const endDateObj = new Date(options.endDate + "T00:00:00Z");
     endDateObj.setUTCDate(endDateObj.getUTCDate() + 1);
     const nextDay = endDateObj.toISOString().split("T")[0];
-    queryParts.push(`created_at:<${nextDay}`);
+    queryParts.push(`created_at:<"${nextDay}"`);
   }
-  const queryString = queryParts.join(" ");
+  const queryString = queryParts.join(" AND ");
   console.log("Shopify orders query:", queryString);
 
   while (hasNextPage) {
