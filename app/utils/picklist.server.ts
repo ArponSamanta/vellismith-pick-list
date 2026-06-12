@@ -77,6 +77,8 @@ async function fetchAllUnfulfilledOrders(
     endDate?: string;
   }
 ) {
+  console.log("========== FETCH ORDERS ==========");
+  console.log("options received:", JSON.stringify(options, null, 2));
   let allOrders: any[] = [];
   let hasNextPage = true;
   let cursor: string | null = null;
@@ -93,6 +95,7 @@ async function fetchAllUnfulfilledOrders(
     const nextDay = endDateObj.toISOString().split("T")[0];
     queryParts.push(`created_at:<"${nextDay}"`);
   }
+  console.log("queryParts before join:", queryParts);
   const queryString = queryParts.join(" AND ");
   console.log("Shopify orders query:", queryString);
 
