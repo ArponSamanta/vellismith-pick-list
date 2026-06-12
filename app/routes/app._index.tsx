@@ -28,6 +28,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const showSku = formData.get("showSku") !== "false";
     const showVariantQuantity = formData.get("showVariantQuantity") !== "false";
 
+    console.log("========== PICK LIST REQUEST ==========");
+    console.log("startDate:", startDate);
+    console.log("endDate:", endDate);
+    console.log("sortBy:", sortBy);
+    console.log("searchKeyword:", searchKeyword);
+    console.log("showSku:", showSku);
+    console.log("showVariantQuantity:", showVariantQuantity);
+
     let pickList = await generatePickList(admin, {
       startDate: startDate || undefined,
       endDate: endDate || undefined,
