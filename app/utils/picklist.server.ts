@@ -117,6 +117,7 @@ async function fetchAllUnfulfilledOrders(
           edges {
             node {
               id
+              name
               createdAt
               lineItems(first: 250) {
                 edges {
@@ -227,12 +228,18 @@ function processOrders(orders: any[]): any[] {
           variantTitle: variant.title,
           sku: variant.sku,
           quantity: 0,
+          orderNumbers: [] as string[],
         };
         productGroup.variants.push(variantGroup);
       }
 
       variantGroup.quantity += lineItem.quantity;
       productGroup.totalQuantity += lineItem.quantity;
+
+      // Track which order numbers contributed to this variant (deduplicated)
+      if (order.name && !variantGroup.orderNumbers.includes(order.name)) {
+        variantGroup.orderNumbers.push(order.name);
+      }
     });
   });
 

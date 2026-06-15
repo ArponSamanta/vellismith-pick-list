@@ -83,6 +83,7 @@ export default function Index() {
   const [sortBy, setSortBy] = useState("alpha");
   const [showSku, setShowSku] = useState(true);
   const [showVariantQuantity, setShowVariantQuantity] = useState(true);
+  const [showOrderId, setShowOrderId] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
 
   const isLoading =
@@ -115,6 +116,7 @@ export default function Index() {
     setSortBy("alpha");
     setShowSku(true);
     setShowVariantQuantity(true);
+    setShowOrderId(false);
   };
 
   const handlePrint = () => {
@@ -288,10 +290,10 @@ export default function Index() {
         /*
          * When window.print() fires:
          *   s-page            → hidden  (removes all Shopify Admin chrome)
-         *   #pick-list-print  → shown   (our 3-column grid)
+         *   #pick-list-print  → shown   (our 4-column grid)
          *
          * Images are kept in their original quality and aspect ratio.
-         * 3 cards per row provides clear, readable product information.
+         * 4 cards per row on A4 portrait for a denser, efficient pick sheet.
          */
         @media print {
           s-page            { display: none !important; }
@@ -302,20 +304,20 @@ export default function Index() {
             color: #000;
           }
 
-          .ph               { margin-bottom: 5mm; }
-          .ph-title         { font-size: 14pt; font-weight: bold; margin: 0 0 2mm; }
-          .ph-meta          { font-size: 8pt; color: #444; margin: 0; }
+          .ph               { margin-bottom: 4mm; }
+          .ph-title         { font-size: 13pt; font-weight: bold; margin: 0 0 2mm; }
+          .ph-meta          { font-size: 7.5pt; color: #444; margin: 0; }
 
-          /* 3 cards per row on A4 portrait */
+          /* 4 cards per row on A4 portrait */
           .pg {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 4mm;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 3mm;
           }
 
           .pc {
             border: 1px solid #ccc;
-            border-radius: 4px;
+            border-radius: 3px;
             overflow: hidden;
             page-break-inside: avoid;
             break-inside: avoid;
@@ -327,25 +329,34 @@ export default function Index() {
           }
           .pc-noimg {
             width: 100%;
-            height: 30mm;
+            height: 22mm;
             background: #f0f0f0;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 7pt;
+            font-size: 6.5pt;
             color: #888;
           }
-          .pc-body  { padding: 2mm 3mm; }
+          .pc-body  { padding: 1.5mm 2.5mm; }
           .pc-title {
-            font-size: 8pt; font-weight: bold; line-height: 1.3;
-            margin-bottom: 1.5mm;
+            font-size: 7.5pt; font-weight: bold; line-height: 1.3;
+            margin-bottom: 1mm;
           }
-          .pc-vars  { font-size: 7pt; color: #555; line-height: 1.4; margin-bottom: 1.5mm; }
+          /* Wrapper for the variant list */
+          .pc-vars  { font-size: 6.5pt; color: #555; line-height: 1.5; margin-bottom: 1mm; }
+          /* Each variant row */
+          .pc-var-row { margin-bottom: 0.8mm; }
+          /* Order IDs line (shown when showOrderId is true) */
+          .pc-orderids {
+            font-size: 6pt; color: #777;
+            line-height: 1.4;
+            margin-bottom: 1mm;
+          }
           .pc-qty   {
             background: #fffacd;
             text-align: center;
-            font-size: 12pt; font-weight: bold;
-            padding: 1.5mm; border-radius: 3px;
+            font-size: 11pt; font-weight: bold;
+            padding: 1mm; border-radius: 2px;
           }
         }
 
@@ -388,9 +399,25 @@ export default function Index() {
                 {showVariantQuantity && (
                   <div className="pc-vars">
                     {product.variants.map((v: any, i: number) => (
-                      <div key={i}>
+                      <div key={i} className="pc-var-row">
                         {v.variantTitle}
-                        {showSku && v.sku ? ` (${v.sku})` : ""}: <b>{v.quantity}</b>
+                        {showSku && v.sku ? ` (${v.sku})` : ""}
+                        {showOrderId && v.orderNumbers?.length > 0
+                          ? ` [${v.orderNumbers.join(", ")}]`
+                          : ""}
+                        : <b>{v.quantity}</b>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {!showVariantQuantity && (showSku || showOrderId) && (
+                  <div className="pc-vars">
+                    {product.variants.map((v: any, i: number) => (
+                      <div key={i}>
+                        {showSku && v.sku ? `SKU: ${v.sku}` : ""}
+                        {showOrderId && v.orderNumbers?.length > 0
+                          ? `${showSku && v.sku ? "  " : ""}[${v.orderNumbers.join(", ")}]`
+                          : ""}
                       </div>
                     ))}
                   </div>
@@ -620,6 +647,14 @@ export default function Index() {
                 />
                 Include Individual Variant Quantity
               </label>
+              <label style={checkboxLabel}>
+                <input
+                  type="checkbox"
+                  checked={showOrderId}
+                  onChange={(e) => setShowOrderId(e.target.checked)}
+                />
+                Include Order IDs
+              </label>
             </div>
 
             {/* Action buttons */}
@@ -726,14 +761,18 @@ export default function Index() {
                           {product.variants.map((variant: any, idx: number) => (
                             <div key={idx}>
                               {variant.variantTitle}
-                              {showSku && variant.sku && ` (${variant.sku})`}:{" "}
+                              {showSku && variant.sku && ` (${variant.sku})`}
+                              {showOrderId && variant.orderNumbers?.length > 0
+                                ? ` [${variant.orderNumbers.join(", ")}]`
+                                : ""}
+                              :{" "}
                               <strong>{variant.quantity}</strong>
                             </div>
                           ))}
                         </div>
                       )}
 
-                      {!showVariantQuantity && showSku && (
+                      {!showVariantQuantity && (showSku || showOrderId) && (
                         <div
                           style={{
                             fontSize: "0.85em",
@@ -742,11 +781,14 @@ export default function Index() {
                             lineHeight: "1.4",
                           }}
                         >
-                          {product.variants.map((variant: any, idx: number) =>
-                            variant.sku ? (
-                              <div key={idx}>SKU: {variant.sku}</div>
-                            ) : null
-                          )}
+                          {product.variants.map((variant: any, idx: number) => (
+                            <div key={idx}>
+                              {showSku && variant.sku && `SKU: ${variant.sku}`}
+                              {showOrderId && variant.orderNumbers?.length > 0
+                                ? `${showSku && variant.sku ? "  " : ""}[${variant.orderNumbers.join(", ")}]`
+                                : ""}
+                            </div>
+                          ))}
                         </div>
                       )}
 
