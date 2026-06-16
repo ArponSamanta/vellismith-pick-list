@@ -11,25 +11,17 @@ function requireAdminAuth(request: Request) {
   const expectedPass = process.env.ADMIN_DATA_PASSWORD;
 
   if (!expectedUser || !expectedPass) {
-    throw new Response(
-      "Set ADMIN_DATA_USER and ADMIN_DATA_PASSWORD to use this page.",
-      { status: 500 }
-    );
+    throw new Response("Set ADMIN_DATA_USER and ADMIN_DATA_PASSWORD", { status: 500 });
   }
 
-  const header = request.headers.get("Authorization");
-  if (header?.startsWith("Basic ")) {
-    const decoded = Buffer.from(header.slice(6), "base64").toString("utf-8");
-    const i = decoded.indexOf(":");
-    const user = decoded.slice(0, i);
-    const pass = decoded.slice(i + 1);
-    if (user === expectedUser && pass === expectedPass) return;
-  }
+  // Check query params instead of Authorization header
+  const url = new URL(request.url);
+  const user = url.searchParams.get("user");
+  const pass = url.searchParams.get("pass");
 
-  throw new Response("Unauthorized", {
-    status: 401,
-    headers: { "WWW-Authenticate": 'Basic realm="Vellismith Admin"' },
-  });
+  if (user === expectedUser && pass === expectedPass) return;
+
+  throw new Response("Unauthorized", { status: 401 });
 }
 
 function maskToken(token: string | null | undefined) {
