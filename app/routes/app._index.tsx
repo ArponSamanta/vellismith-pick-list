@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { flushSync } from "react-dom";
 import type {
   ActionFunctionArgs,
   HeadersFunction,
@@ -63,13 +64,47 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /**
- * Returns the original Shopify CDN URL without any modifications.
- * This preserves the original image quality and aspect ratio.
+ * Returns a Shopify CDN image URL resized to `width` px (Shopify scales the
+ * height proportionally and re-encodes on the fly — never cropped, since we
+ * only ever pass width, never crop/height). Without a width, the CDN serves
+ * the original asset at full resolution — fine on screen since the browser
+ * only fetches it once, but when window.print() rasterizes the page, those
+ * full-resolution originals get embedded into the PDF at full size
+ * regardless of how small the <img> is drawn. That mismatch is what was
+ * making the printed PDF huge. Requesting a sized-down version keeps the
+ * printed photos sharp while cutting the embedded image bytes drastically
+ * versus a full-resolution original. `quality` (1–100) controls JPEG/PNG
+ * compression independent of size — kept high here since manufacturing
+ * needs to read fine jewelry detail off the printed sheet.
  */
-function shopifyImg(url: string | undefined): string {
+function shopifyImg(
+  url: string | undefined,
+  width?: number,
+  quality?: number
+): string {
   if (!url) return "";
-  return url;
+  if (!width && !quality) return url;
+  try {
+    const resized = new URL(url);
+    if (width) resized.searchParams.set("width", String(width));
+    if (quality) resized.searchParams.set("quality", String(quality));
+    return resized.toString();
+  } catch {
+    // Not a parseable absolute URL — fall back to the original.
+    return url;
+  }
 }
+
+// Widths/quality requested from Shopify's CDN for each context.
+// PRINT_IMG_WIDTH is generous (vs. a typical thumbnail) on purpose: this is
+// a manufacturing pick list, so stone colour, filigree, clasp style etc.
+// need to stay legible on the printed sheet. It's still a small fraction of
+// a typical original (1500–3000px+), so the PDF stays well under control.
+// Raise PRINT_IMG_WIDTH/PRINT_IMG_QUALITY further if detail still isn't
+// clear enough on your printer; lower them if the PDF grows too large again.
+const PRINT_IMG_WIDTH = 640;
+const PRINT_IMG_QUALITY = 90;
+const SCREEN_IMG_WIDTH = 440; // on-screen cards are ~220px wide; 2x for retina
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
@@ -85,6 +120,12 @@ export default function Index() {
   const [showVariantQuantity, setShowVariantQuantity] = useState(true);
   const [showOrderId, setShowOrderId] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
+  // Which hidden print container @media print should reveal. Defaults to
+  // "manufacturing" so a stray Ctrl/Cmd+P (bypassing our buttons) falls back
+  // to the original dense grid rather than the newer table.
+  const [printMode, setPrintMode] = useState<"tracking" | "manufacturing">(
+    "manufacturing"
+  );
 
   const isLoading =
     ["loading", "submitting"].includes(fetcher.state) &&
@@ -119,8 +160,15 @@ export default function Index() {
     setShowOrderId(false);
   };
 
-  const handlePrint = () => {
+  const handlePrint = (mode: "tracking" | "manufacturing") => {
     if (!pickList.length) return;
+    // setPrintMode alone is async — without flushSync, window.print() could
+    // fire before React commits the new data-print-mode attribute, printing
+    // whichever list was showing a moment ago instead of the one just
+    // clicked. flushSync forces that commit first.
+    flushSync(() => {
+      setPrintMode(mode);
+    });
     window.print();
   };
 
@@ -279,6 +327,17 @@ export default function Index() {
           .filter-actions s-button {
             width: 100% !important;
           }
+
+          /* Stack the two print-list buttons full width too */
+          .print-actions {
+            flex-direction: column !important;
+            width: 100% !important;
+          }
+
+          .print-actions button,
+          .print-actions s-button {
+            width: 100% !important;
+          }
         }
 
         /* ── Screen: hide the print div ───────────────────────────── */
@@ -289,11 +348,21 @@ export default function Index() {
         /* ── Print ────────────────────────────────────────────────── */
         /*
          * When window.print() fires:
-         *   s-page            → hidden  (removes all Shopify Admin chrome)
-         *   #pick-list-print  → shown   (our 4-column grid)
+         *   s-page            → hidden (removes all Shopify Admin chrome)
+         *   #pick-list-print  → shown, but only ONE of its two children:
+         *     [data-print-mode="manufacturing"] → .pg-wrap (dense 4-up grid)
+         *     [data-print-mode="tracking"]      → .pt-wrap (structured table)
+         *   handlePrint() sets data-print-mode right before calling
+         *   window.print(), so whichever button was clicked is what shows.
          *
-         * Images are kept in their original quality and aspect ratio.
-         * 4 cards per row on A4 portrait for a denser, efficient pick sheet.
+         * Manufacturing list: the original dense 4-up grid — quick to scan
+         * while walking the floor, more products per printed page.
+         * Tracking list: a real <table> — browsers repeat its <thead> on
+         * every printed page automatically, and unlike div/grid layouts it
+         * pastes cleanly into Word/Google Docs straight from print preview.
+         * Both pull the same resized (never cropped), high-quality image
+         * URL per product, so the browser fetches each photo once and
+         * reuses it from cache for whichever list isn't currently showing.
          */
         @media print {
           s-page            { display: none !important; }
@@ -308,13 +377,17 @@ export default function Index() {
           .ph-title         { font-size: 13pt; font-weight: bold; margin: 0 0 2mm; }
           .ph-meta          { font-size: 7.5pt; color: #444; margin: 0; }
 
-          /* 4 cards per row on A4 portrait */
+          /* Only the wrapper matching the active print mode is shown */
+          .pg-wrap, .pt-wrap { display: none !important; }
+          #pick-list-print[data-print-mode="manufacturing"] .pg-wrap { display: block !important; }
+          #pick-list-print[data-print-mode="tracking"] .pt-wrap      { display: block !important; }
+
+          /* ── Manufacturing list: 4 cards per row on A4 portrait ──── */
           .pg {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
             gap: 3mm;
           }
-
           .pc {
             border: 1px solid #ccc;
             border-radius: 3px;
@@ -346,17 +419,65 @@ export default function Index() {
           .pc-vars  { font-size: 6.5pt; color: #555; line-height: 1.5; margin-bottom: 1mm; }
           /* Each variant row */
           .pc-var-row { margin-bottom: 0.8mm; }
-          /* Order IDs line (shown when showOrderId is true) */
-          .pc-orderids {
-            font-size: 6pt; color: #777;
-            line-height: 1.4;
-            margin-bottom: 1mm;
-          }
           .pc-qty   {
             background: #fffacd;
             text-align: center;
             font-size: 11pt; font-weight: bold;
             padding: 1mm; border-radius: 2px;
+          }
+
+          /* ── Tracking list: one row per product ───────────────────── */
+          table.pt {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+          }
+          /* Repeats the header row on every printed page */
+          .pt thead { display: table-header-group; }
+          .pt th, .pt td {
+            border: 1px solid #ccc;
+            padding: 2mm 3mm;
+            vertical-align: middle;
+            text-align: left;
+          }
+          .pt th {
+            background: #eee;
+            font-size: 8pt;
+            font-weight: bold;
+          }
+          .pt tbody tr { page-break-inside: avoid; break-inside: avoid; }
+          .pt tbody tr:nth-child(even) { background: #fafafa; }
+
+          .pt-col-img { width: 40mm; }
+          .pt-col-qty { width: 24mm; text-align: center; }
+
+          .pt-col-img img {
+            width: 100%;
+            height: auto;
+            display: block;
+          }
+          .pt-noimg {
+            width: 100%;
+            height: 28mm;
+            background: #f0f0f0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 6.5pt;
+            color: #888;
+          }
+
+          .pt-title { font-size: 9.5pt; font-weight: bold; line-height: 1.3; margin-bottom: 1mm; }
+          /* Wrapper for the variant list */
+          .pt-vars  { font-size: 7.5pt; color: #555; line-height: 1.6; }
+          /* Each variant row */
+          .pt-var-row { margin-bottom: 0.5mm; }
+
+          .pt-qty {
+            background: #fffacd;
+            text-align: center;
+            font-size: 13pt; font-weight: bold;
+            padding: 1.5mm; border-radius: 2px;
           }
         }
 
@@ -368,7 +489,7 @@ export default function Index() {
       {/* Lives in the DOM at all times; React keeps it up-to-date.           */}
       {/* Made visible only via @media print (see CSS above).                 */}
       {/* ──────────────────────────────────────────────────────────────────── */}
-      <div id="pick-list-print">
+      <div id="pick-list-print" data-print-mode={printMode}>
         <div className="ph">
           <div className="ph-title">📦 Pick List — Unfulfilled Orders</div>
           <div className="ph-meta">
@@ -382,50 +503,125 @@ export default function Index() {
           </div>
         </div>
 
-        <div className="pg">
-          {pickList.map((product: any) => (
-            <div className="pc" key={product.productId}>
-              {product.productImage?.url ? (
-                <img
-                  /* Original image URL - no resizing, no cropping */
-                  src={shopifyImg(product.productImage.url)}
-                  alt={product.productImage?.altText || product.productTitle}
-                />
-              ) : (
-                <div className="pc-noimg">No image</div>
-              )}
-              <div className="pc-body">
-                <div className="pc-title">{product.productTitle}</div>
-                {showVariantQuantity && (
-                  <div className="pc-vars">
-                    {product.variants.map((v: any, i: number) => (
-                      <div key={i} className="pc-var-row">
-                        {v.variantTitle}
-                        {showSku && v.sku ? ` (${v.sku})` : ""}
-                        {showOrderId && v.orderNumbers?.length > 0
-                          ? ` [${v.orderNumbers.join(", ")}]`
-                          : ""}
-                        : <b>{v.quantity}</b>
-                      </div>
-                    ))}
-                  </div>
+        {/* Manufacturing list — dense 4-up grid, shown when printMode === "manufacturing" */}
+        <div className="pg-wrap">
+          <div className="pg">
+            {pickList.map((product: any) => (
+              <div className="pc" key={product.productId}>
+                {product.productImage?.url ? (
+                  <img
+                    /* Resized (never cropped) via Shopify's CDN — high quality
+                       enough to read jewelry detail, far smaller than the original */
+                    src={shopifyImg(
+                      product.productImage.url,
+                      PRINT_IMG_WIDTH,
+                      PRINT_IMG_QUALITY
+                    )}
+                    alt={product.productImage?.altText || product.productTitle}
+                  />
+                ) : (
+                  <div className="pc-noimg">No image</div>
                 )}
-                {!showVariantQuantity && (showSku || showOrderId) && (
-                  <div className="pc-vars">
-                    {product.variants.map((v: any, i: number) => (
-                      <div key={i}>
-                        {showSku && v.sku ? `SKU: ${v.sku}` : ""}
-                        {showOrderId && v.orderNumbers?.length > 0
-                          ? `${showSku && v.sku ? "  " : ""}[${v.orderNumbers.join(", ")}]`
-                          : ""}
-                      </div>
-                    ))}
-                  </div>
-                )}
-                <div className="pc-qty">{product.totalQuantity}</div>
+                <div className="pc-body">
+                  <div className="pc-title">{product.productTitle}</div>
+                  {showVariantQuantity && (
+                    <div className="pc-vars">
+                      {product.variants.map((v: any, i: number) => (
+                        <div key={i} className="pc-var-row">
+                          {v.variantTitle}
+                          {showSku && v.sku ? ` (${v.sku})` : ""}
+                          {showOrderId && v.orderNumbers?.length > 0
+                            ? ` [${v.orderNumbers.join(", ")}]`
+                            : ""}
+                          : <b>{v.quantity}</b>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {!showVariantQuantity && (showSku || showOrderId) && (
+                    <div className="pc-vars">
+                      {product.variants.map((v: any, i: number) => (
+                        <div key={i}>
+                          {showSku && v.sku ? `SKU: ${v.sku}` : ""}
+                          {showOrderId && v.orderNumbers?.length > 0
+                            ? `${showSku && v.sku ? "  " : ""}[${v.orderNumbers.join(", ")}]`
+                            : ""}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="pc-qty">{product.totalQuantity}</div>
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
+          </div>
+        </div>
+
+        {/* Tracking list — structured table, shown when printMode === "tracking" */}
+        <div className="pt-wrap">
+          <table className="pt">
+            <thead>
+              <tr>
+                <th className="pt-col-img">Image</th>
+                <th>Product &amp; Variant Details</th>
+                <th className="pt-col-qty">Qty to Pick</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pickList.map((product: any) => (
+                <tr key={product.productId}>
+                  <td className="pt-col-img">
+                    {product.productImage?.url ? (
+                      <img
+                        /* Resized (never cropped) via Shopify's CDN — high quality
+                           enough to read jewelry detail, far smaller than the original */
+                        src={shopifyImg(
+                          product.productImage.url,
+                          PRINT_IMG_WIDTH,
+                          PRINT_IMG_QUALITY
+                        )}
+                        alt={product.productImage?.altText || product.productTitle}
+                      />
+                    ) : (
+                      <div className="pt-noimg">No image</div>
+                    )}
+                  </td>
+                  <td>
+                    <div className="pt-title">{product.productTitle}</div>
+                    {showVariantQuantity && (
+                      <div className="pt-vars">
+                        {product.variants.map((v: any, i: number) => (
+                          <div key={i} className="pt-var-row">
+                            {v.variantTitle}
+                            {showSku && v.sku ? ` (${v.sku})` : ""}
+                            {showOrderId && v.orderNumbers?.length > 0
+                              ? ` [${v.orderNumbers.join(", ")}]`
+                              : ""}
+                            : <b>{v.quantity}</b>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {!showVariantQuantity && (showSku || showOrderId) && (
+                      <div className="pt-vars">
+                        {product.variants.map((v: any, i: number) => (
+                          <div key={i}>
+                            {showSku && v.sku ? `SKU: ${v.sku}` : ""}
+                            {showOrderId && v.orderNumbers?.length > 0
+                              ? `${showSku && v.sku ? "  " : ""}[${v.orderNumbers.join(", ")}]`
+                              : ""}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </td>
+                  <td className="pt-col-qty">
+                    <div className="pt-qty">{product.totalQuantity}</div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -688,9 +884,27 @@ export default function Index() {
         {/* ── Results ─────────────────────────────────────────────── */}
         {fetcher.data?.success && pickList.length > 0 && (
           <>
-            <div style={{ marginBottom: "24px", marginTop: "32px" }}>
-              <s-button onClick={handlePrint} variant="tertiary">
-                🖨️ Print Pick List
+            <div
+              className="print-actions"
+              style={{
+                display: "flex",
+                gap: "8px",
+                flexWrap: "wrap",
+                marginBottom: "24px",
+                marginTop: "32px",
+              }}
+            >
+              <s-button
+                onClick={() => handlePrint("manufacturing")}
+                variant="tertiary"
+              >
+                🏭 Print Manufacturing List
+              </s-button>
+              <s-button
+                onClick={() => handlePrint("tracking")}
+                variant="tertiary"
+              >
+                📋 Print Tracking List
               </s-button>
             </div>
 
@@ -726,7 +940,7 @@ export default function Index() {
                     }}
                   >
                     <img
-                      src={shopifyImg(product.productImage?.url)}
+                      src={shopifyImg(product.productImage?.url, SCREEN_IMG_WIDTH)}
                       alt={product.productImage?.altText || product.productTitle}
                       style={{
                         width: "100%",
