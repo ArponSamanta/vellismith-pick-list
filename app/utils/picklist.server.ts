@@ -1,7 +1,5 @@
 import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
 
-// ─── Types ───────────────────────────────────────────────────────────────────
-
 export type SortBy =
   | "alpha"
   | "old-to-new"
@@ -42,12 +40,9 @@ interface PickListOptions extends DateRangeOptions {
   sortBy?: SortBy;
 }
 
-// ─── Configuration ───────────────────────────────────────────────────────────
-
-const ORDERS_PER_PAGE = 250;
+const ORDERS_PER_PAGE = 50;
+const LINE_ITEMS_PER_PAGE = 50;
 const RATE_LIMIT_BASE_DELAY = 1000;
-
-// ─── Main Export ─────────────────────────────────────────────────────────────
 
 export async function generatePickList(
   admin: AdminApiContext,
@@ -95,9 +90,7 @@ export async function generatePickList(
     }
 
     const pickList = Array.from(productMap.values());
-
     console.log(`Total time: ${Date.now() - totalStartTime}ms, ${pickList.length} products`);
-
     return sortPickList(pickList, options?.sortBy || "alpha");
   } catch (error) {
     console.error("Error in generatePickList:", error);
@@ -118,10 +111,7 @@ export function filterByProductName(
 
 export function formatPickListAsText(
   pickList: PickListProduct[],
-  options?: {
-    showSku?: boolean;
-    showVariantQuantity?: boolean;
-  }
+  options?: { showSku?: boolean; showVariantQuantity?: boolean }
 ): string {
   const showSku = options?.showSku ?? true;
   const showVariantQuantity = options?.showVariantQuantity ?? true;
@@ -166,8 +156,6 @@ export function formatPickListAsText(
   return header + body + footer;
 }
 
-// ─── Utility ─────────────────────────────────────────────────────────────────
-
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function getNextDayISO(dateString: string): string {
@@ -175,8 +163,6 @@ function getNextDayISO(dateString: string): string {
   date.setUTCDate(date.getUTCDate() + 1);
   return date.toISOString().split("T")[0];
 }
-
-// ─── GraphQL Helper ──────────────────────────────────────────────────────────
 
 async function graphqlWithRetry(
   admin: AdminApiContext,
@@ -209,8 +195,6 @@ async function graphqlWithRetry(
   }
 }
 
-// ─── Fetch ───────────────────────────────────────────────────────────────────
-
 function buildQueryString(
   status: "unshipped" | "partial",
   options?: DateRangeOptions
@@ -220,9 +204,7 @@ function buildQueryString(
     conditions.push(`created_at:>="${options.startDate}T00:00:00Z"`);
   }
   if (options?.endDate) {
-    conditions.push(
-      `created_at:<"${getNextDayISO(options.endDate)}T00:00:00Z"`
-    );
+    conditions.push(`created_at:<"${getNextDayISO(options.endDate)}T00:00:00Z"`);
   }
   const query = conditions.join(" AND ");
   console.log(`Query string (${status}):`, query);
@@ -259,7 +241,8 @@ async function fetchPickListByStatus(
               id
               name
               createdAt
-              lineItems(first: 250) {
+              lineItems(first: ${LINE_ITEMS_PER_PAGE}) {
+                pageInfo { hasNextPage, endCursor }
                 edges {
                   node {
                     id
@@ -294,6 +277,7 @@ async function fetchPickListByStatus(
           name: string;
           createdAt: string;
           lineItems: {
+            pageInfo: { hasNextPage: boolean; endCursor: string | null };
             edges: Array<{
               node: {
                 id: string;
@@ -317,7 +301,7 @@ async function fetchPickListByStatus(
     } | undefined;
 
     if (!orders) {
-      console.log(`No orders data returned for ${status}`);
+      console.log(`No orders data returned for ${status} — query may be too expensive`);
       break;
     }
 
@@ -330,58 +314,10 @@ async function fetchPickListByStatus(
       if (options?.startDate && order.createdAt < `${options.startDate}T00:00:00Z`) continue;
       if (options?.endDate && order.createdAt >= `${getNextDayISO(options.endDate)}T00:00:00Z`) continue;
 
-      if (!order.lineItems?.edges) continue;
+      // Process line items — paginate if needed
+      await processLineItems(order.lineItems, order.name, order.createdAt, productMap, processedLineItemIds, totalLineItems, admin, order.id);
 
-      for (const { node: lineItem } of order.lineItems.edges) {
-        totalLineItems++;
-        if (lineItem.quantity <= 0) continue;
-
-        const variant = lineItem.variant;
-        if (!variant?.product) continue;
-
-        if (processedLineItemIds.has(lineItem.id)) continue;
-        processedLineItemIds.add(lineItem.id);
-
-        const product = variant.product;
-        const productKey = product.id;
-
-        if (!productMap.has(productKey)) {
-          productMap.set(productKey, {
-            productId: product.id,
-            productTitle: product.title,
-            productType: product.productType,
-            productImage: product.featuredImage,
-            variants: [],
-            totalQuantity: 0,
-            earliestCreatedAt: order.createdAt,
-            latestCreatedAt: order.createdAt,
-          });
-        }
-
-        const pg = productMap.get(productKey)!;
-
-        if (order.createdAt < pg.earliestCreatedAt) pg.earliestCreatedAt = order.createdAt;
-        if (order.createdAt > pg.latestCreatedAt) pg.latestCreatedAt = order.createdAt;
-
-        let vg = pg.variants.find((v) => v.variantId === variant.id);
-        if (!vg) {
-          vg = {
-            variantId: variant.id,
-            variantTitle: variant.title,
-            sku: variant.sku,
-            quantity: 0,
-            orderNumbers: [],
-          };
-          pg.variants.push(vg);
-        }
-
-        vg.quantity += lineItem.quantity;
-        pg.totalQuantity += lineItem.quantity;
-
-        if (order.name && !vg.orderNumbers.includes(order.name)) {
-          vg.orderNumbers.push(order.name);
-        }
-      }
+      totalLineItems += order.lineItems.edges.length;
     }
 
     hasNextPage = orders.pageInfo.hasNextPage;
@@ -392,7 +328,141 @@ async function fetchPickListByStatus(
   return Array.from(productMap.values());
 }
 
-// ─── Sort ────────────────────────────────────────────────────────────────────
+async function processLineItems(
+  lineItemsData: {
+    pageInfo: { hasNextPage: boolean; endCursor: string | null };
+    edges: Array<{
+      node: {
+        id: string;
+        quantity: number;
+        variant: {
+          id: string;
+          title: string;
+          sku: string | null;
+          product: {
+            id: string;
+            title: string;
+            productType: string;
+            featuredImage: ShopifyImage | null;
+          };
+        } | null;
+      };
+    }>;
+  },
+  orderName: string,
+  orderDate: string,
+  productMap: Map<string, PickListProduct>,
+  processedLineItemIds: Set<string>,
+  count: number,
+  admin: AdminApiContext,
+  orderId: string
+): Promise<void> {
+  let currentData = lineItemsData;
+  let pageCount = 0;
+
+  while (true) {
+    for (const { node: lineItem } of currentData.edges) {
+      if (lineItem.quantity <= 0) continue;
+      const variant = lineItem.variant;
+      if (!variant?.product) continue;
+      if (processedLineItemIds.has(lineItem.id)) continue;
+      processedLineItemIds.add(lineItem.id);
+
+      const product = variant.product;
+      const productKey = product.id;
+
+      if (!productMap.has(productKey)) {
+        productMap.set(productKey, {
+          productId: product.id,
+          productTitle: product.title,
+          productType: product.productType,
+          productImage: product.featuredImage,
+          variants: [],
+          totalQuantity: 0,
+          earliestCreatedAt: orderDate,
+          latestCreatedAt: orderDate,
+        });
+      }
+
+      const pg = productMap.get(productKey)!;
+      if (orderDate < pg.earliestCreatedAt) pg.earliestCreatedAt = orderDate;
+      if (orderDate > pg.latestCreatedAt) pg.latestCreatedAt = orderDate;
+
+      let vg = pg.variants.find((v) => v.variantId === variant.id);
+      if (!vg) {
+        vg = {
+          variantId: variant.id,
+          variantTitle: variant.title,
+          sku: variant.sku,
+          quantity: 0,
+          orderNumbers: [],
+        };
+        pg.variants.push(vg);
+      }
+
+      vg.quantity += lineItem.quantity;
+      pg.totalQuantity += lineItem.quantity;
+      if (orderName && !vg.orderNumbers.includes(orderName)) {
+        vg.orderNumbers.push(orderName);
+      }
+    }
+
+    if (!currentData.pageInfo.hasNextPage) break;
+
+    // Fetch next page of line items
+    pageCount++;
+    const data = await graphqlWithRetry(
+      admin,
+      `query GetMoreLineItems($orderId: ID!, $cursor: String!) {
+        order(id: $orderId) {
+          lineItems(first: ${LINE_ITEMS_PER_PAGE}, after: $cursor) {
+            pageInfo { hasNextPage, endCursor }
+            edges {
+              node {
+                id
+                quantity
+                variant {
+                  id, title, sku
+                  product {
+                    id, title, productType
+                    featuredImage { url, altText }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }`,
+      { orderId, cursor: currentData.pageInfo.endCursor }
+    );
+
+    const order = data.data?.order as {
+      lineItems: {
+        pageInfo: { hasNextPage: boolean; endCursor: string | null };
+        edges: Array<{
+          node: {
+            id: string;
+            quantity: number;
+            variant: {
+              id: string;
+              title: string;
+              sku: string | null;
+              product: {
+                id: string;
+                title: string;
+                productType: string;
+                featuredImage: ShopifyImage | null;
+              };
+            } | null;
+          };
+        }>;
+      };
+    } | undefined;
+
+    if (!order?.lineItems) break;
+    currentData = order.lineItems;
+  }
+}
 
 function sortPickList(
   pickList: PickListProduct[],
