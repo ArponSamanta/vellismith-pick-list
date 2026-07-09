@@ -40,57 +40,24 @@ interface PickListOptions extends DateRangeOptions {
   sortBy?: SortBy;
 }
 
-const ORDERS_PER_PAGE = 50;
-const LINE_ITEMS_PER_PAGE = 50;
-const RATE_LIMIT_BASE_DELAY = 1000;
+const ORDERS_PER_PAGE = 250;
+const LINE_ITEMS_PER_ORDER = 250;
+const ORDERS_PER_BATCH = 5;
 
 export async function generatePickList(
   admin: AdminApiContext,
   options?: PickListOptions
 ): Promise<PickListProduct[]> {
-  const totalStartTime = Date.now();
-
-  console.log("========== GENERATE PICK LIST ==========");
-  console.log("options:", JSON.stringify(options, null, 2));
-
   try {
-    const [unshippedProducts, partialProducts] = await Promise.all([
-      fetchPickListByStatus(admin, "unshipped", options),
-      fetchPickListByStatus(admin, "partial", options),
+    const [unshippedIds, partialIds] = await Promise.all([
+      fetchOrderIds(admin, "unshipped", options),
+      fetchOrderIds(admin, "partial", options),
     ]);
 
-    console.log(`Unshipped products: ${unshippedProducts.length}`);
-    console.log(`Partial products: ${partialProducts.length}`);
+    const allIds = [...new Set([...unshippedIds, ...partialIds])];
+    if (allIds.length === 0) return [];
 
-    const productMap = new Map<string, PickListProduct>();
-    for (const product of [...unshippedProducts, ...partialProducts]) {
-      const existing = productMap.get(product.productId);
-      if (existing) {
-        for (const v of product.variants) {
-          const ev = existing.variants.find((x) => x.variantId === v.variantId);
-          if (ev) {
-            ev.quantity += v.quantity;
-            for (const on of v.orderNumbers) {
-              if (!ev.orderNumbers.includes(on)) ev.orderNumbers.push(on);
-            }
-          } else {
-            existing.variants.push(v);
-          }
-        }
-        existing.totalQuantity += product.totalQuantity;
-        if (product.earliestCreatedAt < existing.earliestCreatedAt) {
-          existing.earliestCreatedAt = product.earliestCreatedAt;
-        }
-        if (product.latestCreatedAt > existing.latestCreatedAt) {
-          existing.latestCreatedAt = product.latestCreatedAt;
-        }
-      } else {
-        productMap.set(product.productId, product);
-      }
-    }
-
-    const pickList = Array.from(productMap.values());
-    console.log(`Total time: ${Date.now() - totalStartTime}ms, ${pickList.length} products`);
+    const pickList = await fetchLineItemsBatch(admin, allIds);
     return sortPickList(pickList, options?.sortBy || "alpha");
   } catch (error) {
     console.error("Error in generatePickList:", error);
@@ -104,9 +71,7 @@ export function filterByProductName(
 ): PickListProduct[] {
   if (!searchKeyword?.trim()) return pickList;
   const keyword = searchKeyword.toLowerCase();
-  return pickList.filter((product) =>
-    product.productTitle.toLowerCase().includes(keyword)
-  );
+  return pickList.filter((p) => p.productTitle.toLowerCase().includes(keyword));
 }
 
 export function formatPickListAsText(
@@ -156,345 +121,212 @@ export function formatPickListAsText(
   return header + body + footer;
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
 function getNextDayISO(dateString: string): string {
   const date = new Date(`${dateString}T00:00:00Z`);
   date.setUTCDate(date.getUTCDate() + 1);
   return date.toISOString().split("T")[0];
 }
 
-async function graphqlWithRetry(
+async function graphql(
   admin: AdminApiContext,
   query: string,
-  variables: Record<string, unknown>,
-  attempt = 0
+  variables: Record<string, unknown> = {}
 ): Promise<any> {
-  const MAX_RETRIES = 3;
-
-  try {
-    const response: any = await admin.graphql(query, { variables });
-    if (response?.errors) {
-      console.error("GraphQL errors:", JSON.stringify(response.errors));
-      const isRateLimited = response.errors.some(
-        (e: any) => e?.extensions?.code === "THROTTLED"
-      );
-      if (isRateLimited && attempt < MAX_RETRIES) {
-        await sleep(RATE_LIMIT_BASE_DELAY * Math.pow(2, attempt));
-        return graphqlWithRetry(admin, query, variables, attempt + 1);
-      }
-    }
-    return response;
-  } catch (error: any) {
-    console.error("GraphQL exception:", error?.message || error);
-    if (attempt < MAX_RETRIES) {
-      await sleep(RATE_LIMIT_BASE_DELAY * Math.pow(2, attempt));
-      return graphqlWithRetry(admin, query, variables, attempt + 1);
-    }
-    throw error;
-  }
+  return admin.graphql(query, { variables });
 }
 
-function buildQueryString(
-  status: "unshipped" | "partial",
-  options?: DateRangeOptions
-): string {
+// ─── Step 1: Fetch order IDs ─────────────────────────────────────────────────
+
+function buildQueryString(status: string, options?: DateRangeOptions): string {
   const conditions = [`fulfillment_status:${status}`];
-  if (options?.startDate) {
-    conditions.push(`created_at:>="${options.startDate}T00:00:00Z"`);
-  }
-  if (options?.endDate) {
-    conditions.push(`created_at:<"${getNextDayISO(options.endDate)}T00:00:00Z"`);
-  }
-  const query = conditions.join(" AND ");
-  console.log(`Query string (${status}):`, query);
-  return query;
+  if (options?.startDate) conditions.push(`created_at:>="${options.startDate}T00:00:00Z"`);
+  if (options?.endDate) conditions.push(`created_at:<"${getNextDayISO(options.endDate)}T00:00:00Z"`);
+  return conditions.join(" AND ");
 }
 
-async function fetchPickListByStatus(
+async function fetchOrderIds(
   admin: AdminApiContext,
-  status: "unshipped" | "partial",
+  status: string,
   options?: DateRangeOptions
-): Promise<PickListProduct[]> {
-  const productMap = new Map<string, PickListProduct>();
-  const processedLineItemIds = new Set<string>();
-  let hasNextPage = true;
+): Promise<string[]> {
+  const ids: string[] = [];
   let cursor: string | null = null;
+  let hasNextPage = true;
   const queryString = buildQueryString(status, options);
-  let totalOrders = 0;
-  let totalLineItems = 0;
 
   while (hasNextPage) {
-    const data = await graphqlWithRetry(
+    const data = await graphql(
       admin,
-      `query GetOrders($cursor: String, $query: String!) {
-        orders(
-          first: ${ORDERS_PER_PAGE},
-          after: $cursor,
-          query: $query,
-          sortKey: CREATED_AT,
-          reverse: true
-        ) {
+      `query($cursor: String, $query: String!) {
+        orders(first: ${ORDERS_PER_PAGE}, after: $cursor, query: $query, sortKey: CREATED_AT, reverse: true) {
           pageInfo { hasNextPage, endCursor }
-          edges {
-            node {
-              id
-              name
-              createdAt
-              lineItems(first: ${LINE_ITEMS_PER_PAGE}) {
-                pageInfo { hasNextPage, endCursor }
-                edges {
-                  node {
-                    id
-                    quantity
-                    variant {
-                      id, title, sku
-                      product {
-                        id, title, productType
-                        featuredImage { url, altText }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
+          edges { node { id, createdAt } }
         }
       }`,
       { cursor, query: queryString }
     );
 
-    if (data.errors) {
-      console.error(`GraphQL errors (${status}):`, data.errors);
-      throw new Error(`GraphQL error: ${data.errors[0].message}`);
-    }
+    if (data.errors) break;
 
-    const orders = data.data?.orders as {
-      pageInfo: { hasNextPage: boolean; endCursor: string | null };
-      edges: Array<{
-        node: {
-          id: string;
-          name: string;
-          createdAt: string;
-          lineItems: {
-            pageInfo: { hasNextPage: boolean; endCursor: string | null };
-            edges: Array<{
-              node: {
-                id: string;
-                quantity: number;
-                variant: {
-                  id: string;
-                  title: string;
-                  sku: string | null;
-                  product: {
-                    id: string;
-                    title: string;
-                    productType: string;
-                    featuredImage: ShopifyImage | null;
-                  };
-                } | null;
-              };
-            }>;
-          };
-        };
-      }>;
-    } | undefined;
+    const orders = data.data?.orders;
+    if (!orders) break;
 
-    if (!orders) {
-      console.log(`No orders data returned for ${status} — query may be too expensive`);
-      break;
-    }
-
-    console.log(`${status}: got ${orders.edges.length} orders on this page`);
-
-    for (const orderEdge of orders.edges) {
-      const order = orderEdge.node;
-      totalOrders++;
-
-      if (options?.startDate && order.createdAt < `${options.startDate}T00:00:00Z`) continue;
-      if (options?.endDate && order.createdAt >= `${getNextDayISO(options.endDate)}T00:00:00Z`) continue;
-
-      // Process line items — paginate if needed
-      await processLineItems(order.lineItems, order.name, order.createdAt, productMap, processedLineItemIds, totalLineItems, admin, order.id);
-
-      totalLineItems += order.lineItems.edges.length;
+    for (const edge of orders.edges) {
+      const d = edge.node.createdAt;
+      if (options?.startDate && d < `${options.startDate}T00:00:00Z`) continue;
+      if (options?.endDate && d >= `${getNextDayISO(options.endDate)}T00:00:00Z`) continue;
+      ids.push(edge.node.id);
     }
 
     hasNextPage = orders.pageInfo.hasNextPage;
     cursor = orders.pageInfo.endCursor;
   }
 
-  console.log(`${status} summary: ${totalOrders} orders, ${totalLineItems} line items, ${productMap.size} products`);
-  return Array.from(productMap.values());
+  return ids;
 }
 
-async function processLineItems(
-  lineItemsData: {
-    pageInfo: { hasNextPage: boolean; endCursor: string | null };
-    edges: Array<{
-      node: {
-        id: string;
-        quantity: number;
-        variant: {
-          id: string;
-          title: string;
-          sku: string | null;
-          product: {
-            id: string;
-            title: string;
-            productType: string;
-            featuredImage: ShopifyImage | null;
-          };
-        } | null;
-      };
-    }>;
-  },
-  orderName: string,
-  orderDate: string,
-  productMap: Map<string, PickListProduct>,
-  processedLineItemIds: Set<string>,
-  count: number,
-  admin: AdminApiContext,
-  orderId: string
-): Promise<void> {
-  let currentData = lineItemsData;
-  let pageCount = 0;
+// ─── Step 2: Batch fetch line items ──────────────────────────────────────────
 
-  while (true) {
-    for (const { node: lineItem } of currentData.edges) {
-      if (lineItem.quantity <= 0) continue;
-      const variant = lineItem.variant;
-      if (!variant?.product) continue;
-      if (processedLineItemIds.has(lineItem.id)) continue;
-      processedLineItemIds.add(lineItem.id);
-
-      const product = variant.product;
-      const productKey = product.id;
-
-      if (!productMap.has(productKey)) {
-        productMap.set(productKey, {
-          productId: product.id,
-          productTitle: product.title,
-          productType: product.productType,
-          productImage: product.featuredImage,
-          variants: [],
-          totalQuantity: 0,
-          earliestCreatedAt: orderDate,
-          latestCreatedAt: orderDate,
-        });
-      }
-
-      const pg = productMap.get(productKey)!;
-      if (orderDate < pg.earliestCreatedAt) pg.earliestCreatedAt = orderDate;
-      if (orderDate > pg.latestCreatedAt) pg.latestCreatedAt = orderDate;
-
-      let vg = pg.variants.find((v) => v.variantId === variant.id);
-      if (!vg) {
-        vg = {
-          variantId: variant.id,
-          variantTitle: variant.title,
-          sku: variant.sku,
-          quantity: 0,
-          orderNumbers: [],
-        };
-        pg.variants.push(vg);
-      }
-
-      vg.quantity += lineItem.quantity;
-      pg.totalQuantity += lineItem.quantity;
-      if (orderName && !vg.orderNumbers.includes(orderName)) {
-        vg.orderNumbers.push(orderName);
-      }
-    }
-
-    if (!currentData.pageInfo.hasNextPage) break;
-
-    // Fetch next page of line items
-    pageCount++;
-    const data = await graphqlWithRetry(
-      admin,
-      `query GetMoreLineItems($orderId: ID!, $cursor: String!) {
-        order(id: $orderId) {
-          lineItems(first: ${LINE_ITEMS_PER_PAGE}, after: $cursor) {
-            pageInfo { hasNextPage, endCursor }
-            edges {
-              node {
-                id
-                quantity
-                variant {
-                  id, title, sku
-                  product {
-                    id, title, productType
-                    featuredImage { url, altText }
-                  }
-                }
+function buildBatchQuery(orderIds: string[]): string {
+  const fragments = orderIds.map(
+    (id, i) => `
+    o${i}: order(id: "${id}") {
+      id
+      name
+      createdAt
+      lineItems(first: ${LINE_ITEMS_PER_ORDER}) {
+        edges {
+          node {
+            id
+            fulfillableQuantity
+            variant {
+              id, title, sku
+              product {
+                id, title, productType
+                featuredImage { url, altText }
               }
             }
           }
         }
-      }`,
-      { orderId, cursor: currentData.pageInfo.endCursor }
-    );
+      }
+    }`
+  ).join("\n");
 
-    const order = data.data?.order as {
-      lineItems: {
-        pageInfo: { hasNextPage: boolean; endCursor: string | null };
-        edges: Array<{
-          node: {
-            id: string;
-            quantity: number;
-            variant: {
-              id: string;
-              title: string;
-              sku: string | null;
-              product: {
-                id: string;
-                title: string;
-                productType: string;
-                featuredImage: ShopifyImage | null;
-              };
-            } | null;
-          };
-        }>;
-      };
-    } | undefined;
-
-    if (!order?.lineItems) break;
-    currentData = order.lineItems;
-  }
+  return `query { ${fragments} }`;
 }
 
-function sortPickList(
-  pickList: PickListProduct[],
-  sortBy: SortBy
-): PickListProduct[] {
-  for (const product of pickList) {
-    product.variants.sort((a, b) =>
-      a.variantTitle.toLowerCase().localeCompare(b.variantTitle.toLowerCase())
-    );
+async function fetchLineItemsBatch(
+  admin: AdminApiContext,
+  orderIds: string[]
+): Promise<PickListProduct[]> {
+  const productMap = new Map<string, PickListProduct>();
+  const processed = new Set<string>();
+
+  for (let i = 0; i < orderIds.length; i += ORDERS_PER_BATCH) {
+    const batch = orderIds.slice(i, i + ORDERS_PER_BATCH);
+    const query = buildBatchQuery(batch);
+    const data = await graphql(admin, query);
+
+    if (data.errors) continue;
+
+    for (let j = 0; j < batch.length; j++) {
+      const orderData = data.data?.[`o${j}`] as {
+        id: string;
+        name: string;
+        createdAt: string;
+        lineItems?: {
+          edges: Array<{
+            node: {
+              id: string;
+              fulfillableQuantity: number;
+              variant: {
+                id: string;
+                title: string;
+                sku: string | null;
+                product: {
+                  id: string;
+                  title: string;
+                  productType: string;
+                  featuredImage: ShopifyImage | null;
+                };
+              } | null;
+            };
+          }>;
+        };
+      } | undefined;
+
+      if (!orderData?.lineItems?.edges) continue;
+
+      const orderName = orderData.name;
+      const orderDate = orderData.createdAt;
+
+      for (const { node: li } of orderData.lineItems.edges) {
+        // fulfillableQuantity = 0 for fully fulfilled, cancelled, refunded items
+        const qty = li.fulfillableQuantity;
+        if (qty <= 0) continue;
+
+        const v = li.variant;
+        if (!v?.product) continue;
+
+        if (processed.has(li.id)) continue;
+        processed.add(li.id);
+
+        const p = v.product;
+        const key = p.id;
+
+        if (!productMap.has(key)) {
+          productMap.set(key, {
+            productId: p.id,
+            productTitle: p.title,
+            productType: p.productType,
+            productImage: p.featuredImage,
+            variants: [],
+            totalQuantity: 0,
+            earliestCreatedAt: orderDate,
+            latestCreatedAt: orderDate,
+          });
+        }
+
+        const pg = productMap.get(key)!;
+        if (orderDate < pg.earliestCreatedAt) pg.earliestCreatedAt = orderDate;
+        if (orderDate > pg.latestCreatedAt) pg.latestCreatedAt = orderDate;
+
+        let vg = pg.variants.find((x) => x.variantId === v.id);
+        if (!vg) {
+          vg = { variantId: v.id, variantTitle: v.title, sku: v.sku, quantity: 0, orderNumbers: [] };
+          pg.variants.push(vg);
+        }
+
+        vg.quantity += qty;
+        pg.totalQuantity += qty;
+        if (orderName && !vg.orderNumbers.includes(orderName)) {
+          vg.orderNumbers.push(orderName);
+        }
+      }
+    }
+  }
+
+  return Array.from(productMap.values());
+}
+
+// ─── Sort ────────────────────────────────────────────────────────────────────
+
+function sortPickList(list: PickListProduct[], sortBy: SortBy): PickListProduct[] {
+  for (const p of list) {
+    p.variants.sort((a, b) => a.variantTitle.toLowerCase().localeCompare(b.variantTitle.toLowerCase()));
   }
 
   switch (sortBy) {
     case "old-to-new":
-      return [...pickList].sort(
-        (a, b) =>
-          new Date(a.earliestCreatedAt).getTime() -
-          new Date(b.earliestCreatedAt).getTime()
-      );
+      return [...list].sort((a, b) => new Date(a.earliestCreatedAt).getTime() - new Date(b.earliestCreatedAt).getTime());
     case "new-to-old":
-      return [...pickList].sort(
-        (a, b) =>
-          new Date(b.latestCreatedAt).getTime() -
-          new Date(a.latestCreatedAt).getTime()
-      );
+      return [...list].sort((a, b) => new Date(b.latestCreatedAt).getTime() - new Date(a.latestCreatedAt).getTime());
     case "qty-high-to-low":
-      return [...pickList].sort((a, b) => b.totalQuantity - a.totalQuantity);
+      return [...list].sort((a, b) => b.totalQuantity - a.totalQuantity);
     case "qty-low-to-high":
-      return [...pickList].sort((a, b) => a.totalQuantity - b.totalQuantity);
+      return [...list].sort((a, b) => a.totalQuantity - b.totalQuantity);
     case "alpha":
     default:
-      return [...pickList].sort((a, b) =>
-        a.productTitle.toLowerCase().localeCompare(b.productTitle.toLowerCase())
-      );
+      return [...list].sort((a, b) => a.productTitle.toLowerCase().localeCompare(b.productTitle.toLowerCase()));
   }
 }
