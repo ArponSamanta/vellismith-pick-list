@@ -55,16 +55,17 @@ export async function generatePickList(
 ): Promise<PickListProduct[]> {
   const totalStartTime = Date.now();
 
-  if (process.env.NODE_ENV !== "production") {
-    console.log("========== GENERATE PICK LIST ==========");
-    console.log("options:", JSON.stringify(options, null, 2));
-  }
+  console.log("========== GENERATE PICK LIST ==========");
+  console.log("options:", JSON.stringify(options, null, 2));
 
   try {
     const [unshippedProducts, partialProducts] = await Promise.all([
       fetchPickListByStatus(admin, "unshipped", options),
       fetchPickListByStatus(admin, "partial", options),
     ]);
+
+    console.log(`Unshipped products: ${unshippedProducts.length}`);
+    console.log(`Partial products: ${partialProducts.length}`);
 
     const productMap = new Map<string, PickListProduct>();
     for (const product of [...unshippedProducts, ...partialProducts]) {
@@ -95,11 +96,7 @@ export async function generatePickList(
 
     const pickList = Array.from(productMap.values());
 
-    if (process.env.NODE_ENV !== "production") {
-      console.log(
-        `Total time: ${Date.now() - totalStartTime}ms, ${pickList.length} products`
-      );
-    }
+    console.log(`Total time: ${Date.now() - totalStartTime}ms, ${pickList.length} products`);
 
     return sortPickList(pickList, options?.sortBy || "alpha");
   } catch (error) {
@@ -192,6 +189,7 @@ async function graphqlWithRetry(
   try {
     const response: any = await admin.graphql(query, { variables });
     if (response?.errors) {
+      console.error("GraphQL errors:", JSON.stringify(response.errors));
       const isRateLimited = response.errors.some(
         (e: any) => e?.extensions?.code === "THROTTLED"
       );
@@ -202,6 +200,7 @@ async function graphqlWithRetry(
     }
     return response;
   } catch (error: any) {
+    console.error("GraphQL exception:", error?.message || error);
     if (attempt < MAX_RETRIES) {
       await sleep(RATE_LIMIT_BASE_DELAY * Math.pow(2, attempt));
       return graphqlWithRetry(admin, query, variables, attempt + 1);
@@ -225,7 +224,9 @@ function buildQueryString(
       `created_at:<"${getNextDayISO(options.endDate)}T00:00:00Z"`
     );
   }
-  return conditions.join(" AND ");
+  const query = conditions.join(" AND ");
+  console.log(`Query string (${status}):`, query);
+  return query;
 }
 
 async function fetchPickListByStatus(
@@ -238,6 +239,8 @@ async function fetchPickListByStatus(
   let hasNextPage = true;
   let cursor: string | null = null;
   const queryString = buildQueryString(status, options);
+  let totalOrders = 0;
+  let totalLineItems = 0;
 
   while (hasNextPage) {
     const data = await graphqlWithRetry(
@@ -261,7 +264,6 @@ async function fetchPickListByStatus(
                   node {
                     id
                     quantity
-                    fulfillableQuantity
                     variant {
                       id, title, sku
                       product {
@@ -296,7 +298,6 @@ async function fetchPickListByStatus(
               node: {
                 id: string;
                 quantity: number;
-                fulfillableQuantity: number;
                 variant: {
                   id: string;
                   title: string;
@@ -315,25 +316,25 @@ async function fetchPickListByStatus(
       }>;
     } | undefined;
 
-    if (!orders) break;
+    if (!orders) {
+      console.log(`No orders data returned for ${status}`);
+      break;
+    }
+
+    console.log(`${status}: got ${orders.edges.length} orders on this page`);
 
     for (const orderEdge of orders.edges) {
       const order = orderEdge.node;
-      const orderName = order.name;
-      const orderDate = order.createdAt;
+      totalOrders++;
 
-      if (options?.startDate && orderDate < `${options.startDate}T00:00:00Z`) continue;
-      if (options?.endDate && orderDate >= `${getNextDayISO(options.endDate)}T00:00:00Z`) continue;
+      if (options?.startDate && order.createdAt < `${options.startDate}T00:00:00Z`) continue;
+      if (options?.endDate && order.createdAt >= `${getNextDayISO(options.endDate)}T00:00:00Z`) continue;
 
       if (!order.lineItems?.edges) continue;
 
       for (const { node: lineItem } of order.lineItems.edges) {
-        // fulfillableQuantity is the quantity available to fulfill.
-        // For unfulfilled orders: equals quantity.
-        // For partially fulfilled orders: equals remaining quantity.
-        // Returns 0 for fully fulfilled or refunded line items.
-        const qty = lineItem.fulfillableQuantity ?? lineItem.quantity;
-        if (qty <= 0) continue;
+        totalLineItems++;
+        if (lineItem.quantity <= 0) continue;
 
         const variant = lineItem.variant;
         if (!variant?.product) continue;
@@ -352,15 +353,15 @@ async function fetchPickListByStatus(
             productImage: product.featuredImage,
             variants: [],
             totalQuantity: 0,
-            earliestCreatedAt: orderDate,
-            latestCreatedAt: orderDate,
+            earliestCreatedAt: order.createdAt,
+            latestCreatedAt: order.createdAt,
           });
         }
 
         const pg = productMap.get(productKey)!;
 
-        if (orderDate < pg.earliestCreatedAt) pg.earliestCreatedAt = orderDate;
-        if (orderDate > pg.latestCreatedAt) pg.latestCreatedAt = orderDate;
+        if (order.createdAt < pg.earliestCreatedAt) pg.earliestCreatedAt = order.createdAt;
+        if (order.createdAt > pg.latestCreatedAt) pg.latestCreatedAt = order.createdAt;
 
         let vg = pg.variants.find((v) => v.variantId === variant.id);
         if (!vg) {
@@ -374,11 +375,11 @@ async function fetchPickListByStatus(
           pg.variants.push(vg);
         }
 
-        vg.quantity += qty;
-        pg.totalQuantity += qty;
+        vg.quantity += lineItem.quantity;
+        pg.totalQuantity += lineItem.quantity;
 
-        if (orderName && !vg.orderNumbers.includes(orderName)) {
-          vg.orderNumbers.push(orderName);
+        if (order.name && !vg.orderNumbers.includes(order.name)) {
+          vg.orderNumbers.push(order.name);
         }
       }
     }
@@ -387,6 +388,7 @@ async function fetchPickListByStatus(
     cursor = orders.pageInfo.endCursor;
   }
 
+  console.log(`${status} summary: ${totalOrders} orders, ${totalLineItems} line items, ${productMap.size} products`);
   return Array.from(productMap.values());
 }
 
