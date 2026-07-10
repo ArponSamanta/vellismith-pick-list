@@ -28,7 +28,6 @@ export async function generatePickList(
     });
     console.log(`Found ${orders.length} unfulfilled orders from API`);
 
-    // In-memory filter as a safeguard for exact bounds and timezone safety
     if (options?.startDate || options?.endDate) {
       orders = filterOrdersByDateRange(orders, options.startDate, options.endDate);
       console.log(`${orders.length} orders remain after strict date range filter`);
@@ -48,21 +47,15 @@ function filterOrdersByDateRange(
   endDate?: string
 ): any[] {
   return orders.filter((order) => {
-    // order.createdAt is an ISO 8601 string like "2026-06-12T15:30:00Z"
-    // Using string comparison is bulletproof and avoids JS Date local timezone shifts
-    
     if (startDate) {
-      // e.g. "2026-06-12T10:00:00Z" >= "2026-06-12" (true)
       if (order.createdAt < startDate) return false;
     }
     
     if (endDate) {
-      // Add one day to make it strictly less than the next day
       const endDateObj = new Date(endDate + "T00:00:00Z");
       endDateObj.setUTCDate(endDateObj.getUTCDate() + 1);
       const nextDay = endDateObj.toISOString().split("T")[0];
       
-      // e.g. "2026-06-12T10:00:00Z" < "2026-06-13" (true)
       if (order.createdAt >= nextDay) return false;
     }
 
@@ -76,20 +69,18 @@ async function fetchAllUnfulfilledOrders(
     startDate?: string;
     endDate?: string;
   }
-) {
+): Promise<any[]> {
   console.log("========== FETCH ORDERS ==========");
   console.log("options received:", JSON.stringify(options, null, 2));
   let allOrders: any[] = [];
   let hasNextPage = true;
   let cursor: string | null = null;
 
-  // Build the query string with date range filters applied at the API level
   const queryParts = ["fulfillment_status:unshipped"];
   if (options?.startDate) {
     queryParts.push(`created_at:>="${options.startDate}"`);
   }
   if (options?.endDate) {
-    // Add one day to make end date inclusive (created_at:< next day)
     const endDateObj = new Date(options.endDate + "T00:00:00Z");
     endDateObj.setUTCDate(endDateObj.getUTCDate() + 1);
     const nextDay = endDateObj.toISOString().split("T")[0];
@@ -102,14 +93,10 @@ async function fetchAllUnfulfilledOrders(
   while (hasNextPage) {
     console.log("Fetching orders with cursor:", cursor);
     
-    const response: any = await admin.graphql(
+    const graphqlResponse: any = await admin.graphql(
       `#graphql
       query GetUnfulfilledOrders($cursor: String, $query: String!) {
-        orders(
-          first: 250,
-          after: $cursor,
-          query: $query
-        ) {
+        orders(first: 250, after: $cursor, query: $query) {
           pageInfo {
             hasNextPage
             endCursor
@@ -119,22 +106,31 @@ async function fetchAllUnfulfilledOrders(
               id
               name
               createdAt
-              lineItems(first: 250) {
+              fulfillmentOrders(first: 50) {
                 edges {
                   node {
                     id
-                    quantity
-                    variant {
-                      id
-                      title
-                      sku
-                      product {
-                        id
-                        title
-                        productType
-                        featuredImage {
-                          url
-                          altText
+                    status
+                    lineItems(first: 50) {
+                      edges {
+                        node {
+                          id
+                          remainingQuantity
+                          totalQuantity
+                          variant {
+                            id
+                            title
+                            sku
+                            product {
+                              id
+                              title
+                              productType
+                              featuredImage {
+                                url
+                                altText
+                              }
+                            }
+                          }
                         }
                       }
                     }
@@ -150,20 +146,20 @@ async function fetchAllUnfulfilledOrders(
       }
     );
 
-    const data = await response.json();
-    console.log("Response data:", JSON.stringify(data, null, 2).substring(0, 500));
-    
-    if (data.errors) {
-      console.error("GraphQL errors:", data.errors);
-      throw new Error(`GraphQL error: ${data.errors[0].message}`);
+    console.log("GraphQL response - has errors?", !!graphqlResponse.errors);
+    console.log("GraphQL response - has orders?", !!graphqlResponse.data?.orders);
+
+    if (graphqlResponse.errors) {
+      console.error("GraphQL errors:", graphqlResponse.errors);
+      throw new Error(`GraphQL error: ${graphqlResponse.errors[0].message}`);
     }
-    
-    if (!data.data?.orders) {
+
+    if (!graphqlResponse.data?.orders) {
       console.error("No orders data in response");
       throw new Error("Failed to fetch orders from Shopify");
     }
-    
-    const ordersData = data.data.orders;
+
+    const ordersData: any = graphqlResponse.data.orders;
     allOrders.push(...ordersData.edges.map((edge: any) => edge.node));
 
     hasNextPage = ordersData.pageInfo.hasNextPage;
@@ -179,75 +175,98 @@ function processOrders(orders: any[]): any[] {
   const productMap = new Map<string, any>();
 
   orders.forEach((order) => {
-    if (!order.lineItems?.edges) {
-      console.log("Order has no line items:", order.id);
+    const fulfillmentOrders = order.fulfillmentOrders?.edges;
+    if (!fulfillmentOrders?.length) {
+      console.log("Order has no fulfillment orders:", order.name);
       return;
     }
 
-    order.lineItems.edges.forEach(({ node: lineItem }: any) => {
-      const variant = lineItem.variant;
-      const product = variant?.product;
-
-      if (!product) {
-        console.log("Line item has no product:", lineItem.id);
+    fulfillmentOrders.forEach(({ node: fulfillmentOrder }: any) => {
+      if (fulfillmentOrder.status !== "OPEN") {
+        console.log(
+          `Skipping fulfillment order ${fulfillmentOrder.id} - status: ${fulfillmentOrder.status}`
+        );
         return;
       }
 
-      const productKey = product.id;
-
-      if (!productMap.has(productKey)) {
-        productMap.set(productKey, {
-          productId: product.id,
-          productTitle: product.title,
-          productType: product.productType,
-          productImage: product.featuredImage,
-          variants: [],
-          totalQuantity: 0,
-          earliestCreatedAt: order.createdAt,
-          latestCreatedAt: order.createdAt,
-        });
+      const lineItems = fulfillmentOrder.lineItems?.edges;
+      if (!lineItems?.length) {
+        console.log("Fulfillment order has no line items:", fulfillmentOrder.id);
+        return;
       }
 
-      const productGroup = productMap.get(productKey)!;
+      lineItems.forEach(({ node: fulfillmentLineItem }: any) => {
+        const remainingQty = fulfillmentLineItem.remainingQuantity;
 
-      // Track earliest and latest order dates for this product
-      if (new Date(order.createdAt) < new Date(productGroup.earliestCreatedAt)) {
-        productGroup.earliestCreatedAt = order.createdAt;
-      }
-      if (new Date(order.createdAt) > new Date(productGroup.latestCreatedAt)) {
-        productGroup.latestCreatedAt = order.createdAt;
-      }
+        if (remainingQty <= 0) {
+          console.log(
+            `Skipping ${fulfillmentLineItem.variant?.title} - remainingQuantity: ${remainingQty}`
+          );
+          return;
+        }
 
-      let variantGroup = productGroup.variants.find(
-        (v: any) => v.variantId === variant.id
-      );
+        const variant = fulfillmentLineItem.variant;
+        const product = variant?.product;
 
-      if (!variantGroup) {
-        variantGroup = {
-          variantId: variant.id,
-          variantTitle: variant.title,
-          sku: variant.sku,
-          quantity: 0,
-          orderNumbers: [] as string[],
-        };
-        productGroup.variants.push(variantGroup);
-      }
+        if (!product) {
+          console.log("Fulfillment line item has no product:", fulfillmentLineItem.id);
+          return;
+        }
 
-      variantGroup.quantity += lineItem.quantity;
-      productGroup.totalQuantity += lineItem.quantity;
+        const productKey = product.id;
 
-      // Track which order numbers contributed to this variant (deduplicated)
-      if (order.name && !variantGroup.orderNumbers.includes(order.name)) {
-        variantGroup.orderNumbers.push(order.name);
-      }
+        if (!productMap.has(productKey)) {
+          productMap.set(productKey, {
+            productId: product.id,
+            productTitle: product.title,
+            productType: product.productType,
+            productImage: product.featuredImage,
+            variants: [],
+            totalQuantity: 0,
+            earliestCreatedAt: order.createdAt,
+            latestCreatedAt: order.createdAt,
+          });
+        }
+
+        const productGroup = productMap.get(productKey)!;
+
+        if (order.createdAt < productGroup.earliestCreatedAt) {
+          productGroup.earliestCreatedAt = order.createdAt;
+        }
+        if (order.createdAt > productGroup.latestCreatedAt) {
+          productGroup.latestCreatedAt = order.createdAt;
+        }
+
+        let variantGroup = productGroup.variants.find(
+          (v: any) => v.variantId === variant.id
+        );
+
+        if (!variantGroup) {
+          variantGroup = {
+            variantId: variant.id,
+            variantTitle: variant.title,
+            sku: variant.sku,
+            quantity: 0,
+            orderNumbers: [] as string[],
+          };
+          productGroup.variants.push(variantGroup);
+        }
+
+        variantGroup.quantity += remainingQty;
+        productGroup.totalQuantity += remainingQty;
+
+        if (order.name && !variantGroup.orderNumbers.includes(order.name)) {
+          variantGroup.orderNumbers.push(order.name);
+        }
+      });
     });
   });
 
+  console.log(`Processed ${productMap.size} unique products`);
   return Array.from(productMap.values());
 }
 
 function sortPickList(pickList: any[], sortBy: SortBy): any[] {
-  // Always sort variants alphabetically within each product
   pickList.forEach((product) => {
     product.variants.sort((va: any, vb: any) => {
       const variantA = va.variantTitle.toLowerCase();
