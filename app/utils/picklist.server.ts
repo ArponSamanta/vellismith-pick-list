@@ -56,9 +56,12 @@ export async function generatePickList(
     ]);
 
     const allIds = [...new Set([...unshippedIds, ...partialIds])];
+    console.log(`Total orders to process: ${allIds.length}`);
+
     if (allIds.length === 0) return [];
 
     const pickList = await fetchFulfillmentData(admin, allIds);
+    console.log(`Final pick list: ${pickList.length} products`);
     return sortPickList(pickList, options?.sortBy || "alpha");
   } catch (error) {
     console.error("Error in generatePickList:", error);
@@ -182,6 +185,7 @@ async function fetchOrderIds(
     cursor = orders.pageInfo.endCursor;
   }
 
+  console.log(`${status}: found ${ids.length} order IDs`);
   return ids;
 }
 
@@ -193,6 +197,9 @@ async function fetchFulfillmentData(
 ): Promise<PickListProduct[]> {
   const productMap = new Map<string, PickListProduct>();
   const processedLineItemIds = new Set<string>();
+  let ordersWithFOs = 0;
+  let ordersWithoutFOs = 0;
+  let totalLineItems = 0;
 
   for (let i = 0; i < orderIds.length; i += CONCURRENT_REQUESTS) {
     const batch = orderIds.slice(i, i + CONCURRENT_REQUESTS);
@@ -237,7 +244,10 @@ async function fetchFulfillmentData(
     );
 
     for (const result of results) {
-      if (result.status === "rejected") continue;
+      if (result.status === "rejected") {
+        console.error("Request failed:", result.reason);
+        continue;
+      }
 
       const order = result.value?.data?.order as {
         id: string;
@@ -272,7 +282,19 @@ async function fetchFulfillmentData(
         };
       } | undefined;
 
-      if (!order?.fulfillmentOrders?.edges) continue;
+      if (!order) {
+        console.log("No order data in response");
+        continue;
+      }
+
+      const foCount = order.fulfillmentOrders?.edges?.length ?? 0;
+
+      if (!order.fulfillmentOrders?.edges) {
+        ordersWithoutFOs++;
+        continue;
+      }
+
+      ordersWithFOs++;
 
       for (const foEdge of order.fulfillmentOrders.edges) {
         const fo = foEdge.node;
@@ -288,6 +310,7 @@ async function fetchFulfillmentData(
 
           if (processedLineItemIds.has(li.id)) continue;
           processedLineItemIds.add(li.id);
+          totalLineItems++;
 
           const p = v.product;
           const key = p.id;
@@ -325,6 +348,7 @@ async function fetchFulfillmentData(
     }
   }
 
+  console.log(`Orders with FOs: ${ordersWithFOs}, without FOs: ${ordersWithoutFOs}, total line items: ${totalLineItems}, products: ${productMap.size}`);
   return Array.from(productMap.values());
 }
 
