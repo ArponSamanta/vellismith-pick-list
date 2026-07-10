@@ -71,11 +71,11 @@ async function fetchAllUnfulfilledOrders(
   }
 ): Promise<any[]> {
   console.log("========== FETCH ORDERS ==========");
-  console.log("options received:", JSON.stringify(options, null, 2));
   let allOrders: any[] = [];
   let hasNextPage = true;
   let cursor: string | null = null;
 
+  // Step 1: Build query for orders only (lightweight)
   const queryParts = ["fulfillment_status:unshipped"];
   if (options?.startDate) {
     queryParts.push(`created_at:>="${options.startDate}"`);
@@ -86,17 +86,17 @@ async function fetchAllUnfulfilledOrders(
     const nextDay = endDateObj.toISOString().split("T")[0];
     queryParts.push(`created_at:<"${nextDay}"`);
   }
-  console.log("queryParts before join:", queryParts);
   const queryString = queryParts.join(" AND ");
   console.log("Shopify orders query:", queryString);
 
+  // Step 2: Fetch orders (no fulfillment data yet — keeps cost low)
   while (hasNextPage) {
     console.log("Fetching orders with cursor:", cursor);
     
     const graphqlResponse: any = await admin.graphql(
       `#graphql
       query GetUnfulfilledOrders($cursor: String, $query: String!) {
-        orders(first: 250, after: $cursor, query: $query) {
+        orders(first: 50, after: $cursor, query: $query) {
           pageInfo {
             hasNextPage
             endCursor
@@ -106,37 +106,6 @@ async function fetchAllUnfulfilledOrders(
               id
               name
               createdAt
-              fulfillmentOrders(first: 50) {
-                edges {
-                  node {
-                    id
-                    status
-                    lineItems(first: 50) {
-                      edges {
-                        node {
-                          id
-                          remainingQuantity
-                          totalQuantity
-                          variant {
-                            id
-                            title
-                            sku
-                            product {
-                              id
-                              title
-                              productType
-                              featuredImage {
-                                url
-                                altText
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
             }
           }
         }
@@ -145,9 +114,6 @@ async function fetchAllUnfulfilledOrders(
         variables: { cursor, query: queryString },
       }
     );
-
-    console.log("GraphQL response - has errors?", !!graphqlResponse.errors);
-    console.log("GraphQL response - has orders?", !!graphqlResponse.data?.orders);
 
     if (graphqlResponse.errors) {
       console.error("GraphQL errors:", graphqlResponse.errors);
@@ -166,7 +132,93 @@ async function fetchAllUnfulfilledOrders(
     cursor = ordersData.pageInfo.endCursor;
   }
 
-  return allOrders;
+  console.log(`Found ${allOrders.length} orders, fetching fulfillment data...`);
+
+  // Step 3: Fetch fulfillment orders for each order (in batches to avoid rate limits)
+  const ordersWithFulfillment = await fetchFulfillmentDataInBatches(admin, allOrders);
+  
+  return ordersWithFulfillment;
+}
+
+async function fetchFulfillmentDataInBatches(
+  admin: AdminApiContext,
+  orders: any[]
+): Promise<any[]> {
+  const BATCH_SIZE = 5; // Process 5 orders at a time
+  const results: any[] = [];
+
+  for (let i = 0; i < orders.length; i += BATCH_SIZE) {
+    const batch = orders.slice(i, i + BATCH_SIZE);
+    console.log(`Fetching fulfillment data for batch ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} orders)`);
+    
+    const batchResults = await Promise.all(
+      batch.map((order) => fetchFulfillmentForOrder(admin, order))
+    );
+    
+    results.push(...batchResults);
+  }
+
+  return results;
+}
+
+async function fetchFulfillmentForOrder(
+  admin: AdminApiContext,
+  order: any
+): Promise<any> {
+  const orderId = order.id;
+  
+  const graphqlResponse: any = await admin.graphql(
+    `#graphql
+    query GetFulfillmentOrders($orderId: ID!) {
+      order(id: $orderId) {
+        id
+        name
+        createdAt
+        fulfillmentOrders(first: 50) {
+          edges {
+            node {
+              id
+              status
+              lineItems(first: 50) {
+                edges {
+                  node {
+                    id
+                    remainingQuantity
+                    totalQuantity
+                    variant {
+                      id
+                      title
+                      sku
+                      product {
+                        id
+                        title
+                        productType
+                        featuredImage {
+                          url
+                          altText
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }`,
+    {
+      variables: { orderId },
+    }
+  );
+
+  if (graphqlResponse.errors) {
+    console.error(`GraphQL errors for order ${order.name}:`, graphqlResponse.errors);
+    // Return order without fulfillment data rather than failing entirely
+    return { ...order, fulfillmentOrders: { edges: [] } };
+  }
+
+  return graphqlResponse.data?.order || order;
 }
 
 function processOrders(orders: any[]): any[] {
