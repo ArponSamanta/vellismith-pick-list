@@ -116,6 +116,9 @@ export async function generatePickList(
   admin: AdminApiContext,
   options?: PickListOptions
 ): Promise<PickListProduct[]> {
+
+  console.log("GENERATE", options);
+
   try {
     // Phase 1 — lightweight ID fetch for both order statuses concurrently.
     // "unshipped" = nothing fulfilled yet; "partial" = some done, some pending.
@@ -226,6 +229,10 @@ function localDateToUTCString(dateStr: string, isExclusiveEnd: boolean): string 
 }
 
 function buildQueryString(status: string, options?: DateRangeOptions): string {
+
+  console.log("BUILD QUERY OPTIONS:");
+  console.log(options);
+
   const conditions = [`fulfillment_status:${status}`];
   if (options?.startDate) {
     const startUTC = localDateToUTCString(options.startDate, false);

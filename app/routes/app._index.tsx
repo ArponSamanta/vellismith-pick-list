@@ -33,6 +33,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     console.log("========== PICK LIST REQUEST ==========");
     console.log({ startDate, endDate, sortBy, searchKeyword, showSku, showVariantQuantity });
+    
+    console.log("ACTION", { startDate, endDate });
 
     let pickList = await generatePickList(admin, {
       startDate: startDate || undefined,
