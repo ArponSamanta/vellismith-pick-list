@@ -108,7 +108,7 @@ const FO_PER_ORDER = 3;  // fulfillmentOrders(first:) — Vellismith is single-l
 const ITEMS_PER_FO = 30; // lineItems(first:) per FO — plenty for jewelry orders (typically 1-10)
 
 /** Alias-batch requests to fire in parallel per round. */
-const CONCURRENT_BATCHES = 3;
+const CONCURRENT_BATCHES = 1;
 
 // ─── Exported API ─────────────────────────────────────────────────────────────
 
@@ -370,17 +370,13 @@ async function fetchFulfillmentData(
   orderIds: string[]
 ): Promise<PickListProduct[]> {
   const productMap = new Map<string, PickListProduct>();
-  // Deduplication guard — a line item should only appear in one FO, but
-  // this protects against any edge-case double-count.
   const seenLineItemIds = new Set<string>();
 
-  // Split IDs into fixed-size alias batches.
   const batches: string[][] = [];
   for (let i = 0; i < orderIds.length; i += ORDERS_PER_BATCH) {
     batches.push(orderIds.slice(i, i + ORDERS_PER_BATCH));
   }
 
-  // Fire CONCURRENT_BATCHES requests at a time.
   for (let round = 0; round < batches.length; round += CONCURRENT_BATCHES) {
     const concurrent = batches.slice(round, round + CONCURRENT_BATCHES);
 
@@ -411,6 +407,11 @@ async function fetchFulfillmentData(
         if (!order?.fulfillmentOrders?.edges) continue;
         processOrderFulfillments(order, productMap, seenLineItemIds);
       }
+    }
+
+    // Wait between rounds to avoid throttling
+    if (round + CONCURRENT_BATCHES < batches.length) {
+      await new Promise((r) => setTimeout(r, 1000));
     }
   }
 
