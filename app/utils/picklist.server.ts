@@ -50,6 +50,8 @@ export async function generatePickList(
   options?: PickListOptions
 ): Promise<PickListProduct[]> {
   try {
+    const testData = await graphql(admin, `query { shop { name } }`);
+    console.log("Shop test:", JSON.stringify(testData.data?.shop));
     const [unshippedIds, partialIds] = await Promise.all([
       fetchOrderIds(admin, "unshipped", options),
       fetchOrderIds(admin, "partial", options),
