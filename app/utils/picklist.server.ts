@@ -229,30 +229,22 @@ function localDateToUTCString(dateStr: string, isExclusiveEnd: boolean): string 
 }
 
 function buildQueryString(status: string, options?: DateRangeOptions): string {
-  console.log("BUILD QUERY OPTIONS:", options);
-  console.log("startDate =", options?.startDate);
-  console.log("typeof =", typeof options?.startDate);
-  console.log("length =", options?.startDate?.length);
-
   const conditions = [`fulfillment_status:${status}`];
 
-  if (options?.startDate) {
-    console.log("ENTERED START DATE BLOCK");
+  if (options && options.startDate) {
     const startUTC = localDateToUTCString(options.startDate, false);
-    console.log(startUTC);
     conditions.push(`created_at:>=${startUTC}`);
   }
 
-  if (options?.endDate) {
-    console.log("ENTERED END DATE BLOCK");
+  if (options && options.endDate) {
     const endUTC = localDateToUTCString(options.endDate, true);
-    console.log(endUTC);
     conditions.push(`created_at:<${endUTC}`);
   }
 
-  console.log("FINAL QUERY:", conditions.join(" AND "));
+  const query = conditions.join(" AND ");
+  console.log("FINAL QUERY:", query);
 
-  return conditions.join(" AND ");
+  return query;
 }
 
 /**
