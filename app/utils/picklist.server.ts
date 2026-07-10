@@ -1,7 +1,5 @@
 import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
 
-// ─── Public types ─────────────────────────────────────────────────────────────
-
 export type SortBy =
   | "alpha"
   | "old-to-new"
@@ -9,456 +7,200 @@ export type SortBy =
   | "qty-high-to-low"
   | "qty-low-to-high";
 
-// ─── Internal types ───────────────────────────────────────────────────────────
-
-interface ShopifyImage {
-  url: string;
-  altText: string | null;
-}
-
-interface PickListProduct {
-  productId: string;
-  productTitle: string;
-  productType: string;
-  productImage: ShopifyImage | null;
-  variants: VariantGroup[];
-  totalQuantity: number;
-  earliestCreatedAt: string;
-  latestCreatedAt: string;
-}
-
-interface VariantGroup {
-  variantId: string;
-  variantTitle: string;
-  sku: string | null;
-  quantity: number;
-  orderNumbers: string[];
-}
-
-interface DateRangeOptions {
-  startDate?: string;
-  endDate?: string;
-}
-
-interface PickListOptions extends DateRangeOptions {
-  sortBy?: SortBy;
-}
-
-interface FetchedOrder {
-  id: string;
-  name: string;
-  createdAt: string;
-  fulfillmentOrders?: {
-    edges: Array<{
-      node: {
-        status: string;
-        lineItems?: {
-          edges: Array<{
-            node: {
-              id: string;
-              remainingQuantity: number;
-              variant: {
-                id: string;
-                title: string;
-                sku: string | null;
-                product: {
-                  id: string;
-                  title: string;
-                  productType: string;
-                  featuredImage: ShopifyImage | null;
-                };
-              } | null;
-            };
-          }>;
-        };
-      };
-    }>;
-  };
-}
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-/**
- * Vellismith is based in West Bengal, India (IST = UTC+5:30).
- * Date inputs from the filter UI are YYYY-MM-DD strings in the merchant's
- * local calendar. We convert them to UTC using this offset so that the
- * Shopify API query and the in-memory guard both operate on IST-midnight
- * boundaries instead of UTC-midnight ones.
- *
- * Example: "2026-07-05" as startDate → 2026-07-04T18:30:00.000Z (UTC)
- *           "2026-07-05" as endDate   → exclusive end = 2026-07-05T18:30:00.000Z (UTC)
- */
-const STORE_TZ_OFFSET_MINUTES = 330; // IST = UTC+5:30
-
-/** IDs-only first pass — max Shopify allows per page. */
-const ORDERS_PER_PAGE = 250;
-
-/**
- * Number of orders alias-batched into a single GraphQL request for the
- * fulfillment-order data pass. One batch's Shopify query cost:
- *   ORDERS_PER_BATCH × (1 + FO_PER_ORDER + FO_PER_ORDER × ITEMS_PER_FO)
- *   = 10 × (1 + 3 + 3 × 30) = 10 × 94 = 940 — safely under Shopify's
- *   1 000-point per-call budget.
- *
- * Reduce ORDERS_PER_BATCH (or FO_PER_ORDER / ITEMS_PER_FO) if Shopify
- * starts returning THROTTLED / query-cost errors.
- */
-const ORDERS_PER_BATCH = 10;
-const FO_PER_ORDER = 3;  // fulfillmentOrders(first:) — Vellismith is single-location so 1 is typical
-const ITEMS_PER_FO = 30; // lineItems(first:) per FO — plenty for jewelry orders (typically 1-10)
-
-/** Alias-batch requests to fire in parallel per round. */
-const CONCURRENT_BATCHES = 1;
-
-// ─── Exported API ─────────────────────────────────────────────────────────────
-
 export async function generatePickList(
   admin: AdminApiContext,
-  options?: PickListOptions
-): Promise<PickListProduct[]> {
-
-  console.log("GENERATE", options);
-
+  options?: {
+    startDate?: string;
+    endDate?: string;
+    sortBy?: SortBy;
+  }
+) {
+  console.log("========== GENERATE PICK LIST ==========");
+  console.log("options:", JSON.stringify(options, null, 2));
   try {
-    // Phase 1 — lightweight ID fetch for both order statuses concurrently.
-    // "unshipped" = nothing fulfilled yet; "partial" = some done, some pending.
-    const [unshippedIds, partialIds] = await Promise.all([
-      fetchOrderIds(admin, "unshipped", options),
-      fetchOrderIds(admin, "partial", options),
-    ]);
+    console.log("Passing to fetchAllUnfulfilledOrders:", {
+      startDate: options?.startDate,
+      endDate: options?.endDate,
+    });
+    let orders = await fetchAllUnfulfilledOrders(admin, {
+      startDate: options?.startDate,
+      endDate: options?.endDate,
+    });
+    console.log(`Found ${orders.length} unfulfilled orders from API`);
 
-    // An order can't be both unshipped AND partial at the same time, but
-    // deduplication is cheap and guards against any unexpected overlap.
-    const allIds = [...new Set([...unshippedIds, ...partialIds])];
-    console.log(
-      `[picklist] phase 1 — ${unshippedIds.length} unshipped + ` +
-      `${partialIds.length} partial = ${allIds.length} unique orders`
-    );
+    // In-memory filter as a safeguard for exact bounds and timezone safety
+    if (options?.startDate || options?.endDate) {
+      orders = filterOrdersByDateRange(orders, options.startDate, options.endDate);
+      console.log(`${orders.length} orders remain after strict date range filter`);
+    }
 
-    if (allIds.length === 0) return [];
-
-    // Phase 2 — fetch fulfillment order data (remainingQuantity) in alias batches.
-    const pickList = await fetchFulfillmentData(admin, allIds);
-    console.log(`[picklist] phase 2 — ${pickList.length} products to pick`);
-
-    return sortPickList(pickList, options?.sortBy ?? "alpha");
+    const pickList = processOrders(orders);
+    return sortPickList(pickList, options?.sortBy || "alpha");
   } catch (error) {
-    console.error("[picklist] generatePickList error:", error);
+    console.error("Error in generatePickList:", error);
     throw error;
   }
 }
 
-export function filterByProductName(
-  pickList: PickListProduct[],
-  searchKeyword?: string
-): PickListProduct[] {
-  if (!searchKeyword?.trim()) return pickList;
-  const keyword = searchKeyword.toLowerCase();
-  return pickList.filter((p) => p.productTitle.toLowerCase().includes(keyword));
-}
-
-export function formatPickListAsText(
-  pickList: PickListProduct[],
-  options?: { showSku?: boolean; showVariantQuantity?: boolean }
-): string {
-  const showSku = options?.showSku ?? true;
-  const showVariantQuantity = options?.showVariantQuantity ?? true;
-
-  const lines: string[] = [
-    "",
-    "========================================",
-    "          PICKING LIST - UNFULFILLED",
-    `          Date: ${new Date().toLocaleDateString()}`,
-    "========================================",
-    "",
-  ];
-
-  for (const product of pickList) {
-    lines.push(
-      "┌─────────────────────────────────────┐",
-      `│ PRODUCT: ${product.productTitle.padEnd(30)} │`,
-      `│ Total Qty to Pick: ${String(product.totalQuantity).padEnd(21)} │`,
-      "└─────────────────────────────────────┘",
-      ""
-    );
-    if (showVariantQuantity) {
-      for (const variant of product.variants) {
-        const skuPart = showSku && variant.sku ? ` (SKU: ${variant.sku})` : "";
-        lines.push(
-          `  Variant: ${variant.variantTitle}${skuPart}`,
-          `  Quantity Needed: ${variant.quantity}`,
-          "-".repeat(50)
-        );
-      }
-    }
-  }
-
-  const totalItems = pickList.reduce((sum, p) => sum + p.totalQuantity, 0);
-  lines.push(
-    "========================================",
-    `  Total Products: ${pickList.length}`,
-    `  Total Items: ${totalItems}`,
-    "========================================"
-  );
-
-  return lines.join("\n");
-}
-
-// ─── Date helpers ─────────────────────────────────────────────────────────────
-
-/**
- * Converts a merchant-local YYYY-MM-DD string to a UTC ISO timestamp,
- * treating the input as a date in STORE_TZ_OFFSET_MINUTES timezone.
- *
- * isExclusiveEnd=false → start of that local day in UTC  (used for >=)
- * isExclusiveEnd=true  → start of the *next* local day in UTC (used for <,
- *                        so the entire end date is included)
- *
- * For IST (UTC+5:30), "2026-07-05" with isExclusiveEnd=false:
- *   2026-07-05 00:00:00 IST = 2026-07-04T18:30:00.000Z ✓
- * For IST, "2026-07-05" with isExclusiveEnd=true:
- *   2026-07-06 00:00:00 IST = 2026-07-05T18:30:00.000Z ✓
- */
-function localDateToUTCString(dateStr: string, isExclusiveEnd: boolean): string {
-  const offsetMs = STORE_TZ_OFFSET_MINUTES * 60 * 1000;
-  // Parse as UTC midnight then subtract the store offset → local midnight in UTC.
-  const localMidnightUTC = Date.parse(`${dateStr}T00:00:00Z`) - offsetMs;
-  // For the exclusive end advance by exactly one local day (86 400 s).
-  const adjustedMs = localMidnightUTC + (isExclusiveEnd ? 86_400_000 : 0);
-  return new Date(adjustedMs).toISOString();
-}
-
-function buildQueryString(status: string, options?: DateRangeOptions): string {
-  const conditions = [`fulfillment_status:${status}`];
-
-  if (options && options.startDate) {
-    const startUTC = localDateToUTCString(options.startDate, false);
-    conditions.push(`created_at:>=${startUTC}`);
-  }
-
-  if (options && options.endDate) {
-    const endUTC = localDateToUTCString(options.endDate, true);
-    conditions.push(`created_at:<${endUTC}`);
-  }
-
-  const query = conditions.join(" AND ");
-  console.log("FINAL QUERY:", query);
-
-  return query;
-}
-
-/**
- * In-memory guard using the same IST-aware UTC boundaries as the API query.
- * Catches any overfetch that can happen at pagination cursor boundaries
- * (rare, but possible when an order is created between the time the query
- * runs and the cursor advances).
- */
-function isWithinDateRange(
-  createdAt: string,
+function filterOrdersByDateRange(
+  orders: any[],
   startDate?: string,
   endDate?: string
-): boolean {
-  if (!startDate && !endDate) return true;
-  if (startDate && createdAt < localDateToUTCString(startDate, false)) return false;
-  if (endDate && createdAt >= localDateToUTCString(endDate, true)) return false;
-  return true;
+): any[] {
+  return orders.filter((order) => {
+    // order.createdAt is an ISO 8601 string like "2026-06-12T15:30:00Z"
+    // Using string comparison is bulletproof and avoids JS Date local timezone shifts
+    
+    if (startDate) {
+      // e.g. "2026-06-12T10:00:00Z" >= "2026-06-12" (true)
+      if (order.createdAt < startDate) return false;
+    }
+    
+    if (endDate) {
+      // Add one day to make it strictly less than the next day
+      const endDateObj = new Date(endDate + "T00:00:00Z");
+      endDateObj.setUTCDate(endDateObj.getUTCDate() + 1);
+      const nextDay = endDateObj.toISOString().split("T")[0];
+      
+      // e.g. "2026-06-12T10:00:00Z" < "2026-06-13" (true)
+      if (order.createdAt >= nextDay) return false;
+    }
+
+    return true;
+  });
 }
 
-// ─── Phase 1: collect order IDs (IDs + createdAt only) ───────────────────────
-
-async function fetchOrderIds(
+async function fetchAllUnfulfilledOrders(
   admin: AdminApiContext,
-  status: string,
-  options?: DateRangeOptions
-): Promise<string[]> {
-  const ids: string[] = [];
-  let cursor: string | null = null;
+  options?: {
+    startDate?: string;
+    endDate?: string;
+  }
+) {
+  console.log("========== FETCH ORDERS ==========");
+  console.log("options received:", JSON.stringify(options, null, 2));
+  let allOrders: any[] = [];
   let hasNextPage = true;
-  const queryString = buildQueryString(status, options);
+  let cursor: string | null = null;
+
+  // Build the query string with date range filters applied at the API level
+  const queryParts = ["fulfillment_status:unshipped"];
+  if (options?.startDate) {
+    queryParts.push(`created_at:>="${options.startDate}"`);
+  }
+  if (options?.endDate) {
+    // Add one day to make end date inclusive (created_at:< next day)
+    const endDateObj = new Date(options.endDate + "T00:00:00Z");
+    endDateObj.setUTCDate(endDateObj.getUTCDate() + 1);
+    const nextDay = endDateObj.toISOString().split("T")[0];
+    queryParts.push(`created_at:<"${nextDay}"`);
+  }
+  console.log("queryParts before join:", queryParts);
+  const queryString = queryParts.join(" AND ");
+  console.log("Shopify orders query:", queryString);
 
   while (hasNextPage) {
+    console.log("Fetching orders with cursor:", cursor);
+    
     const response: any = await admin.graphql(
-      `query GetOrderIds($cursor: String, $query: String!) {
+      `#graphql
+      query GetUnfulfilledOrders($cursor: String, $query: String!) {
         orders(
-          first: ${ORDERS_PER_PAGE},
+          first: 250,
           after: $cursor,
-          query: $query,
-          sortKey: CREATED_AT,
-          reverse: true
+          query: $query
         ) {
-          pageInfo { hasNextPage endCursor }
-          edges { node { id createdAt } }
-        }
-      }`,
-      { variables: { cursor, query: queryString } }
-    );
-
-    const data: any = await response.json();
-
-    if (data.errors) {
-      console.error(`[picklist] fetchOrderIds(${status}) errors:`, data.errors);
-      break;
-    }
-
-    const orders = data.data?.orders;
-    if (!orders) break;
-
-    for (const { node } of orders.edges) {
-      // In-memory IST-aware guard for exact boundary correctness.
-      if (!isWithinDateRange(node.createdAt, options?.startDate, options?.endDate)) continue;
-      ids.push(node.id);
-    }
-
-    hasNextPage = orders.pageInfo.hasNextPage;
-    cursor = orders.pageInfo.endCursor;
-  }
-
-  console.log(`[picklist] fetchOrderIds(${status}): ${ids.length} IDs`);
-  return ids;
-}
-
-// ─── Phase 2: fetch fulfillment data via alias batches ───────────────────────
-
-/**
- * Builds one GraphQL document that alias-fetches fulfillment orders (with
- * remainingQuantity) for up to ORDERS_PER_BATCH order IDs in a single HTTP
- * request. This eliminates the N-per-order round-trips of the naive approach:
- *
- *   Before (naive):  100 orders → 100 individual requests (10 concurrent)
- *   After  (batch):  100 orders → 10 alias-batch requests (3 concurrent)
- *
- * IDs are inlined as literals (not variables) because each batch differs in
- * size and GraphQL has no way to variable-ise a set of aliases. JSON.stringify
- * correctly escapes the Shopify GID strings.
- */
-function buildBatchQuery(orderIds: string[]): string {
-  const aliases = orderIds.map(
-    (id, i) => `
-  o${i}: order(id: ${JSON.stringify(id)}) {
-    id
-    name
-    createdAt
-    fulfillmentOrders(first: ${FO_PER_ORDER}) {
-      edges {
-        node {
-          status
-          lineItems(first: ${ITEMS_PER_FO}) {
-            edges {
-              node {
-                id
-                remainingQuantity
-                variant {
-                  id
-                  title
-                  sku
-                  product {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          edges {
+            node {
+              id
+              name
+              createdAt
+              lineItems(first: 250) {
+                edges {
+                  node {
                     id
-                    title
-                    productType
-                    featuredImage { url altText }
+                    quantity
+                    variant {
+                      id
+                      title
+                      sku
+                      product {
+                        id
+                        title
+                        productType
+                        featuredImage {
+                          url
+                          altText
+                        }
+                      }
+                    }
                   }
                 }
               }
             }
           }
         }
+      }`,
+      {
+        variables: { cursor, query: queryString },
       }
-    }
-  }`
-  );
-
-  return `query BatchFulfillmentOrders {\n${aliases.join("\n")}\n}`;
-}
-
-async function fetchFulfillmentData(
-  admin: AdminApiContext,
-  orderIds: string[]
-): Promise<PickListProduct[]> {
-  const productMap = new Map<string, PickListProduct>();
-  const seenLineItemIds = new Set<string>();
-
-  const batches: string[][] = [];
-  for (let i = 0; i < orderIds.length; i += ORDERS_PER_BATCH) {
-    batches.push(orderIds.slice(i, i + ORDERS_PER_BATCH));
-  }
-
-  for (let round = 0; round < batches.length; round += CONCURRENT_BATCHES) {
-    const concurrent = batches.slice(round, round + CONCURRENT_BATCHES);
-
-    const results = await Promise.allSettled(
-      concurrent.map(async (batchIds) => {
-        const query = buildBatchQuery(batchIds);
-        const response: any = await admin.graphql(query);
-        const data: any = await response.json();
-        return { data, count: batchIds.length };
-      })
     );
 
-    for (const result of results) {
-      if (result.status === "rejected") {
-        console.error("[picklist] batch request rejected:", result.reason);
-        continue;
-      }
-
-      const { data, count } = result.value;
-
-      if (data.errors) {
-        console.error("[picklist] batch GQL errors:", data.errors);
-        continue;
-      }
-
-      for (let j = 0; j < count; j++) {
-        const order = data.data?.[`o${j}`] as FetchedOrder | undefined;
-        if (!order?.fulfillmentOrders?.edges) continue;
-        processOrderFulfillments(order, productMap, seenLineItemIds);
-      }
+    const data = await response.json();
+    console.log("Response data:", JSON.stringify(data, null, 2).substring(0, 500));
+    
+    if (data.errors) {
+      console.error("GraphQL errors:", data.errors);
+      throw new Error(`GraphQL error: ${data.errors[0].message}`);
     }
-
-    // Wait between rounds to avoid throttling
-    if (round + CONCURRENT_BATCHES < batches.length) {
-      await new Promise((r) => setTimeout(r, 1000));
+    
+    if (!data.data?.orders) {
+      console.error("No orders data in response");
+      throw new Error("Failed to fetch orders from Shopify");
     }
+    
+    const ordersData = data.data.orders;
+    allOrders.push(...ordersData.edges.map((edge: any) => edge.node));
+
+    hasNextPage = ordersData.pageInfo.hasNextPage;
+    cursor = ordersData.pageInfo.endCursor;
   }
 
-  return Array.from(productMap.values());
+  return allOrders;
 }
 
-/**
- * Walks a single order's fulfillment orders and accumulates remaining quantities
- * into productMap. Extracted so fetchFulfillmentData stays readable.
- */
-function processOrderFulfillments(
-  order: FetchedOrder,
-  productMap: Map<string, PickListProduct>,
-  seenLineItemIds: Set<string>
-): void {
-  for (const { node: fo } of order.fulfillmentOrders!.edges) {
-    // OPEN       = awaiting fulfillment action.
-    // IN_PROGRESS = being picked / packed right now.
-    // Everything else (CLOSED, CANCELLED, ON_HOLD, SCHEDULED) is skipped.
-    if (fo.status !== "OPEN" && fo.status !== "IN_PROGRESS") continue;
-    if (!fo.lineItems?.edges) continue;
+function processOrders(orders: any[]): any[] {
+  console.log(`Processing ${orders.length} orders`);
 
-    for (const { node: li } of fo.lineItems.edges) {
-      // remainingQuantity handles every "should skip" case in one field:
-      //   • fully fulfilled items            → 0
-      //   • items removed by an order edit   → 0
-      //   • refunded items                   → 0
-      if (li.remainingQuantity <= 0) continue;
+  const productMap = new Map<string, any>();
 
-      const v = li.variant;
-      if (!v?.product) continue; // product deleted from Shopify
+  orders.forEach((order) => {
+    if (!order.lineItems?.edges) {
+      console.log("Order has no line items:", order.id);
+      return;
+    }
 
-      if (seenLineItemIds.has(li.id)) continue;
-      seenLineItemIds.add(li.id);
+    order.lineItems.edges.forEach(({ node: lineItem }: any) => {
+      const variant = lineItem.variant;
+      const product = variant?.product;
 
-      const p = v.product;
-      if (!productMap.has(p.id)) {
-        productMap.set(p.id, {
-          productId: p.id,
-          productTitle: p.title,
-          productType: p.productType,
-          productImage: p.featuredImage,
+      if (!product) {
+        console.log("Line item has no product:", lineItem.id);
+        return;
+      }
+
+      const productKey = product.id;
+
+      if (!productMap.has(productKey)) {
+        productMap.set(productKey, {
+          productId: product.id,
+          productTitle: product.title,
+          productType: product.productType,
+          productImage: product.featuredImage,
           variants: [],
           totalQuantity: 0,
           earliestCreatedAt: order.createdAt,
@@ -466,62 +208,145 @@ function processOrderFulfillments(
         });
       }
 
-      const pg = productMap.get(p.id)!;
-      if (order.createdAt < pg.earliestCreatedAt) pg.earliestCreatedAt = order.createdAt;
-      if (order.createdAt > pg.latestCreatedAt) pg.latestCreatedAt = order.createdAt;
+      const productGroup = productMap.get(productKey)!;
 
-      let vg = pg.variants.find((x) => x.variantId === v.id);
-      if (!vg) {
-        vg = {
-          variantId: v.id,
-          variantTitle: v.title,
-          sku: v.sku,
+      // Track earliest and latest order dates for this product
+      if (new Date(order.createdAt) < new Date(productGroup.earliestCreatedAt)) {
+        productGroup.earliestCreatedAt = order.createdAt;
+      }
+      if (new Date(order.createdAt) > new Date(productGroup.latestCreatedAt)) {
+        productGroup.latestCreatedAt = order.createdAt;
+      }
+
+      let variantGroup = productGroup.variants.find(
+        (v: any) => v.variantId === variant.id
+      );
+
+      if (!variantGroup) {
+        variantGroup = {
+          variantId: variant.id,
+          variantTitle: variant.title,
+          sku: variant.sku,
           quantity: 0,
-          orderNumbers: [],
+          orderNumbers: [] as string[],
         };
-        pg.variants.push(vg);
+        productGroup.variants.push(variantGroup);
       }
 
-      vg.quantity += li.remainingQuantity;
-      pg.totalQuantity += li.remainingQuantity;
-      if (order.name && !vg.orderNumbers.includes(order.name)) {
-        vg.orderNumbers.push(order.name);
+      variantGroup.quantity += lineItem.quantity;
+      productGroup.totalQuantity += lineItem.quantity;
+
+      // Track which order numbers contributed to this variant (deduplicated)
+      if (order.name && !variantGroup.orderNumbers.includes(order.name)) {
+        variantGroup.orderNumbers.push(order.name);
       }
-    }
-  }
+    });
+  });
+
+  return Array.from(productMap.values());
 }
 
-// ─── Sort ─────────────────────────────────────────────────────────────────────
+function sortPickList(pickList: any[], sortBy: SortBy): any[] {
+  // Always sort variants alphabetically within each product
+  pickList.forEach((product) => {
+    product.variants.sort((va: any, vb: any) => {
+      const variantA = va.variantTitle.toLowerCase();
+      const variantB = vb.variantTitle.toLowerCase();
+      if (variantA < variantB) return -1;
+      if (variantA > variantB) return 1;
+      return 0;
+    });
+  });
 
-function sortPickList(list: PickListProduct[], sortBy: SortBy): PickListProduct[] {
-  // Always sort variants within each product alphabetically first.
-  for (const p of list) {
-    p.variants.sort((a, b) =>
-      a.variantTitle.toLowerCase().localeCompare(b.variantTitle.toLowerCase())
-    );
-  }
-
-  const sorted = [...list]; // avoid mutating the original array
   switch (sortBy) {
     case "old-to-new":
-      return sorted.sort(
+      return pickList.sort(
         (a, b) =>
           new Date(a.earliestCreatedAt).getTime() -
           new Date(b.earliestCreatedAt).getTime()
       );
+
     case "new-to-old":
-      return sorted.sort(
+      return pickList.sort(
         (a, b) =>
           new Date(b.latestCreatedAt).getTime() -
           new Date(a.latestCreatedAt).getTime()
       );
+
     case "qty-high-to-low":
-      return sorted.sort((a, b) => b.totalQuantity - a.totalQuantity);
+      return pickList.sort((a, b) => b.totalQuantity - a.totalQuantity);
+
     case "qty-low-to-high":
-      return sorted.sort((a, b) => a.totalQuantity - b.totalQuantity);
-    default: // "alpha"
-      return sorted.sort((a, b) =>
-        a.productTitle.toLowerCase().localeCompare(b.productTitle.toLowerCase())
-      );
+      return pickList.sort((a, b) => a.totalQuantity - b.totalQuantity);
+
+    case "alpha":
+    default:
+      return pickList.sort((a, b) => {
+        const nameA = a.productTitle.toLowerCase();
+        const nameB = b.productTitle.toLowerCase();
+        if (nameA < nameB) return -1;
+        if (nameA > nameB) return 1;
+        return 0;
+      });
   }
+}
+
+export function filterByProductName(
+  pickList: any[],
+  searchKeyword?: string
+): any[] {
+  if (!searchKeyword || searchKeyword.trim() === "") return pickList;
+
+  const keyword = searchKeyword.toLowerCase();
+  return pickList.filter((product) =>
+    product.productTitle.toLowerCase().includes(keyword)
+  );
+}
+
+export function formatPickListAsText(
+  pickList: any[],
+  options?: {
+    showSku?: boolean;
+    showVariantQuantity?: boolean;
+  }
+): string {
+  const showSku = options?.showSku ?? true;
+  const showVariantQuantity = options?.showVariantQuantity ?? true;
+
+  const header = `
+========================================
+          PICKING LIST - UNFULFILLED
+          Date: ${new Date().toLocaleDateString()}
+========================================
+
+`;
+
+  let body = "";
+  pickList.forEach((product: any) => {
+    body += `
+┌─────────────────────────────────────┐
+│ PRODUCT: ${product.productTitle.padEnd(30)} │
+│ Total Qty to Pick: ${product.totalQuantity.toString().padEnd(21)} │
+└─────────────────────────────────────┘
+`;
+
+    if (showVariantQuantity) {
+      product.variants.forEach((variant: any) => {
+        const skuPart = showSku && variant.sku ? ` (SKU: ${variant.sku})` : "";
+        body += `\n  Variant: ${variant.variantTitle}${skuPart}`;
+        body += `\n  Quantity Needed: ${variant.quantity}`;
+        body += "\n" + "-".repeat(50) + "\n";
+      });
+    }
+  });
+
+  const totalItems = pickList.reduce((sum: number, p: any) => sum + p.totalQuantity, 0);
+  const footer = `
+========================================
+  Total Products: ${pickList.length}
+  Total Items: ${totalItems}
+========================================
+`;
+
+  return header + body + footer;
 }
