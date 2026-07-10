@@ -43,17 +43,14 @@ interface PickListOptions extends DateRangeOptions {
 const ORDERS_PER_PAGE = 250;
 const FULFILLMENT_ORDERS_PER_ORDER = 20;
 const LINE_ITEMS_PER_FO = 250;
-const CONCURRENT_REQUESTS = 10;
+const CONCURRENT_REQUESTS = 3;
+const RATE_LIMIT_DELAY = 2000;
 
 export async function generatePickList(
   admin: AdminApiContext,
   options?: PickListOptions
 ): Promise<PickListProduct[]> {
   try {
-    const testResponse: any = await admin.graphql(`query { shop { name } }`);
-    const testData: any = await testResponse.json();
-    console.log("Shop test:", JSON.stringify(testData));
-
     const [unshippedIds, partialIds] = await Promise.all([
       fetchOrderIds(admin, "unshipped", options),
       fetchOrderIds(admin, "partial", options),
@@ -129,10 +126,38 @@ export function formatPickListAsText(
   return header + body + footer;
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 function getNextDayISO(dateString: string): string {
   const date = new Date(`${dateString}T00:00:00Z`);
   date.setUTCDate(date.getUTCDate() + 1);
   return date.toISOString().split("T")[0];
+}
+
+// ─── GraphQL with retry ─────────────────────────────────────────────────────
+
+async function graphqlWithRetry(
+  admin: AdminApiContext,
+  query: string,
+  variables: Record<string, unknown> = {},
+  attempt = 0
+): Promise<any> {
+  try {
+    const response: any = await admin.graphql(query, { variables });
+    const data: any = await response.json();
+    return data;
+  } catch (error: any) {
+    const isThrottled = error?.message?.includes("Throttled") ||
+      error?.response?.status === 429;
+    
+    if (isThrottled && attempt < 3) {
+      const delay = RATE_LIMIT_DELAY * Math.pow(2, attempt);
+      console.log(`Throttled, retrying in ${delay}ms (attempt ${attempt + 1})`);
+      await sleep(delay);
+      return graphqlWithRetry(admin, query, variables, attempt + 1);
+    }
+    throw error;
+  }
 }
 
 // ─── Step 1: Fetch order IDs ─────────────────────────────────────────────────
@@ -153,28 +178,34 @@ async function fetchOrderIds(
   let cursor: string | null = null;
   let hasNextPage = true;
   const queryString = buildQueryString(status, options);
+  console.log(`${status} query: ${queryString}`);
 
   while (hasNextPage) {
-    const response: any = await admin.graphql(
+    const data = await graphqlWithRetry(
+      admin,
       `query($cursor: String, $query: String!) {
         orders(first: ${ORDERS_PER_PAGE}, after: $cursor, query: $query, sortKey: CREATED_AT, reverse: true) {
           pageInfo { hasNextPage, endCursor }
           edges { node { id, createdAt } }
         }
       }`,
-      { variables: { cursor, query: queryString } }
+      { cursor, query: queryString }
     );
 
-    const data: any = await response.json();
-
-    if (data.errors) break;
+    if (data.errors) {
+      console.error(`${status} errors:`, JSON.stringify(data.errors));
+      break;
+    }
+    
     const orders = data.data?.orders;
-    if (!orders) break;
+    if (!orders) {
+      console.log(`${status}: no orders data returned`);
+      break;
+    }
+
+    console.log(`${status}: got ${orders.edges.length} orders on this page`);
 
     for (const edge of orders.edges) {
-      const d = edge.node.createdAt;
-      if (options?.startDate && d < `${options.startDate}T00:00:00Z`) continue;
-      if (options?.endDate && d >= `${getNextDayISO(options.endDate)}T00:00:00Z`) continue;
       ids.push(edge.node.id);
     }
 
@@ -186,7 +217,7 @@ async function fetchOrderIds(
   return ids;
 }
 
-// ─── Step 2: Fetch fulfillment orders per order with concurrency ─────────────
+// ─── Step 2: Fetch fulfillment orders ────────────────────────────────────────
 
 async function fetchFulfillmentData(
   admin: AdminApiContext,
@@ -194,16 +225,15 @@ async function fetchFulfillmentData(
 ): Promise<PickListProduct[]> {
   const productMap = new Map<string, PickListProduct>();
   const processedLineItemIds = new Set<string>();
-  let ordersWithFOs = 0;
-  let ordersWithoutFOs = 0;
-  let totalLineItems = 0;
+  let processed = 0;
 
   for (let i = 0; i < orderIds.length; i += CONCURRENT_REQUESTS) {
     const batch = orderIds.slice(i, i + CONCURRENT_REQUESTS);
 
     const results = await Promise.allSettled(
-      batch.map(async (orderId) => {
-        const response: any = await admin.graphql(
+      batch.map((orderId) =>
+        graphqlWithRetry(
+          admin,
           `query($orderId: ID!) {
             order(id: $orderId) {
               id
@@ -234,18 +264,13 @@ async function fetchFulfillmentData(
               }
             }
           }`,
-          { variables: { orderId } }
-        );
-        const data: any = await response.json();
-        return data;
-      })
+          { orderId }
+        )
+      )
     );
 
     for (const result of results) {
-      if (result.status === "rejected") {
-        console.error("Request failed:", result.reason);
-        continue;
-      }
+      if (result.status === "rejected") continue;
 
       const order = result.value?.data?.order as {
         id: string;
@@ -280,14 +305,7 @@ async function fetchFulfillmentData(
         };
       } | undefined;
 
-      if (!order) continue;
-
-      if (!order.fulfillmentOrders?.edges) {
-        ordersWithoutFOs++;
-        continue;
-      }
-
-      ordersWithFOs++;
+      if (!order?.fulfillmentOrders?.edges) continue;
 
       for (const foEdge of order.fulfillmentOrders.edges) {
         const fo = foEdge.node;
@@ -303,7 +321,6 @@ async function fetchFulfillmentData(
 
           if (processedLineItemIds.has(li.id)) continue;
           processedLineItemIds.add(li.id);
-          totalLineItems++;
 
           const p = v.product;
           const key = p.id;
@@ -339,9 +356,15 @@ async function fetchFulfillmentData(
         }
       }
     }
+
+    processed += batch.length;
+    
+    if (i + CONCURRENT_REQUESTS < orderIds.length) {
+      await sleep(500);
+    }
   }
 
-  console.log(`Orders with FOs: ${ordersWithFOs}, without FOs: ${ordersWithoutFOs}, total line items: ${totalLineItems}, products: ${productMap.size}`);
+  console.log(`Processed ${processed} orders, ${productMap.size} products`);
   return Array.from(productMap.values());
 }
 
