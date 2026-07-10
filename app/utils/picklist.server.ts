@@ -41,8 +41,9 @@ interface PickListOptions extends DateRangeOptions {
 }
 
 const ORDERS_PER_PAGE = 250;
-const LINE_ITEMS_PER_ORDER = 250;
-const ORDERS_PER_BATCH = 5;
+const FULFILLMENT_ORDERS_PER_ORDER = 20;
+const LINE_ITEMS_PER_FO = 250;
+const CONCURRENT_REQUESTS = 10;
 
 export async function generatePickList(
   admin: AdminApiContext,
@@ -57,7 +58,7 @@ export async function generatePickList(
     const allIds = [...new Set([...unshippedIds, ...partialIds])];
     if (allIds.length === 0) return [];
 
-    const pickList = await fetchLineItemsBatch(admin, allIds);
+    const pickList = await fetchFulfillmentData(admin, allIds);
     return sortPickList(pickList, options?.sortBy || "alpha");
   } catch (error) {
     console.error("Error in generatePickList:", error);
@@ -167,7 +168,6 @@ async function fetchOrderIds(
     );
 
     if (data.errors) break;
-
     const orders = data.data?.orders;
     if (!orders) break;
 
@@ -185,122 +185,141 @@ async function fetchOrderIds(
   return ids;
 }
 
-// ─── Step 2: Batch fetch line items ──────────────────────────────────────────
+// ─── Step 2: Fetch fulfillment orders per order with concurrency ─────────────
 
-function buildBatchQuery(orderIds: string[]): string {
-  const fragments = orderIds.map(
-    (id, i) => `
-    o${i}: order(id: "${id}") {
-      id
-      name
-      createdAt
-      lineItems(first: ${LINE_ITEMS_PER_ORDER}) {
-        edges {
-          node {
-            id
-            fulfillableQuantity
-            variant {
-              id, title, sku
-              product {
-                id, title, productType
-                featuredImage { url, altText }
-              }
-            }
-          }
-        }
-      }
-    }`
-  ).join("\n");
-
-  return `query { ${fragments} }`;
-}
-
-async function fetchLineItemsBatch(
+async function fetchFulfillmentData(
   admin: AdminApiContext,
   orderIds: string[]
 ): Promise<PickListProduct[]> {
   const productMap = new Map<string, PickListProduct>();
-  const processed = new Set<string>();
+  const processedLineItemIds = new Set<string>();
 
-  for (let i = 0; i < orderIds.length; i += ORDERS_PER_BATCH) {
-    const batch = orderIds.slice(i, i + ORDERS_PER_BATCH);
-    const query = buildBatchQuery(batch);
-    const data = await graphql(admin, query);
+  for (let i = 0; i < orderIds.length; i += CONCURRENT_REQUESTS) {
+    const batch = orderIds.slice(i, i + CONCURRENT_REQUESTS);
 
-    if (data.errors) continue;
+    const results = await Promise.allSettled(
+      batch.map((orderId) =>
+        graphql(
+          admin,
+          `query($orderId: ID!) {
+            order(id: $orderId) {
+              id
+              name
+              createdAt
+              fulfillmentOrders(first: ${FULFILLMENT_ORDERS_PER_ORDER}) {
+                edges {
+                  node {
+                    id
+                    status
+                    lineItems(first: ${LINE_ITEMS_PER_FO}) {
+                      edges {
+                        node {
+                          id
+                          remainingQuantity
+                          variant {
+                            id, title, sku
+                            product {
+                              id, title, productType
+                              featuredImage { url, altText }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }`,
+          { orderId }
+        )
+      )
+    );
 
-    for (let j = 0; j < batch.length; j++) {
-      const orderData = data.data?.[`o${j}`] as {
+    for (const result of results) {
+      if (result.status === "rejected") continue;
+
+      const order = result.value?.data?.order as {
         id: string;
         name: string;
         createdAt: string;
-        lineItems?: {
+        fulfillmentOrders?: {
           edges: Array<{
             node: {
               id: string;
-              fulfillableQuantity: number;
-              variant: {
-                id: string;
-                title: string;
-                sku: string | null;
-                product: {
-                  id: string;
-                  title: string;
-                  productType: string;
-                  featuredImage: ShopifyImage | null;
-                };
-              } | null;
+              status: string;
+              lineItems?: {
+                edges: Array<{
+                  node: {
+                    id: string;
+                    remainingQuantity: number;
+                    variant: {
+                      id: string;
+                      title: string;
+                      sku: string | null;
+                      product: {
+                        id: string;
+                        title: string;
+                        productType: string;
+                        featuredImage: ShopifyImage | null;
+                      };
+                    } | null;
+                  };
+                }>;
+              };
             };
           }>;
         };
       } | undefined;
 
-      if (!orderData?.lineItems?.edges) continue;
+      if (!order?.fulfillmentOrders?.edges) continue;
 
-      const orderName = orderData.name;
-      const orderDate = orderData.createdAt;
+      for (const foEdge of order.fulfillmentOrders.edges) {
+        const fo = foEdge.node;
 
-      for (const { node: li } of orderData.lineItems.edges) {
-        // fulfillableQuantity = 0 for fully fulfilled, cancelled, refunded items
-        const qty = li.fulfillableQuantity;
-        if (qty <= 0) continue;
+        if (fo.status !== "OPEN" && fo.status !== "IN_PROGRESS") continue;
+        if (!fo.lineItems?.edges) continue;
 
-        const v = li.variant;
-        if (!v?.product) continue;
+        for (const { node: li } of fo.lineItems.edges) {
+          if (li.remainingQuantity <= 0) continue;
 
-        if (processed.has(li.id)) continue;
-        processed.add(li.id);
+          const v = li.variant;
+          if (!v?.product) continue;
 
-        const p = v.product;
-        const key = p.id;
+          if (processedLineItemIds.has(li.id)) continue;
+          processedLineItemIds.add(li.id);
 
-        if (!productMap.has(key)) {
-          productMap.set(key, {
-            productId: p.id,
-            productTitle: p.title,
-            productType: p.productType,
-            productImage: p.featuredImage,
-            variants: [],
-            totalQuantity: 0,
-            earliestCreatedAt: orderDate,
-            latestCreatedAt: orderDate,
-          });
-        }
+          const p = v.product;
+          const key = p.id;
 
-        const pg = productMap.get(key)!;
-        if (orderDate < pg.earliestCreatedAt) pg.earliestCreatedAt = orderDate;
-        if (orderDate > pg.latestCreatedAt) pg.latestCreatedAt = orderDate;
+          if (!productMap.has(key)) {
+            productMap.set(key, {
+              productId: p.id,
+              productTitle: p.title,
+              productType: p.productType,
+              productImage: p.featuredImage,
+              variants: [],
+              totalQuantity: 0,
+              earliestCreatedAt: order.createdAt,
+              latestCreatedAt: order.createdAt,
+            });
+          }
 
-        let vg = pg.variants.find((x) => x.variantId === v.id);
-        if (!vg) {
-          vg = { variantId: v.id, variantTitle: v.title, sku: v.sku, quantity: 0, orderNumbers: [] };
-          pg.variants.push(vg);
-        }
+          const pg = productMap.get(key)!;
+          if (order.createdAt < pg.earliestCreatedAt) pg.earliestCreatedAt = order.createdAt;
+          if (order.createdAt > pg.latestCreatedAt) pg.latestCreatedAt = order.createdAt;
 
-        vg.quantity += qty;
-        pg.totalQuantity += qty;
-        if (orderName && !vg.orderNumbers.includes(orderName)) {
-          vg.orderNumbers.push(orderName);
+          let vg = pg.variants.find((x) => x.variantId === v.id);
+          if (!vg) {
+            vg = { variantId: v.id, variantTitle: v.title, sku: v.sku, quantity: 0, orderNumbers: [] };
+            pg.variants.push(vg);
+          }
+
+          vg.quantity += li.remainingQuantity;
+          pg.totalQuantity += li.remainingQuantity;
+          if (order.name && !vg.orderNumbers.includes(order.name)) {
+            vg.orderNumbers.push(order.name);
+          }
         }
       }
     }
