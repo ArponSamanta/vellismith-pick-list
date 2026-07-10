@@ -50,8 +50,10 @@ export async function generatePickList(
   options?: PickListOptions
 ): Promise<PickListProduct[]> {
   try {
-    const testData = await graphql(admin, `query { shop { name } }`);
-    console.log("Shop test:", JSON.stringify(testData.data?.shop));
+    const testResponse: any = await admin.graphql(`query { shop { name } }`);
+    const testData: any = await testResponse.json();
+    console.log("Shop test:", JSON.stringify(testData));
+
     const [unshippedIds, partialIds] = await Promise.all([
       fetchOrderIds(admin, "unshipped", options),
       fetchOrderIds(admin, "partial", options),
@@ -133,14 +135,6 @@ function getNextDayISO(dateString: string): string {
   return date.toISOString().split("T")[0];
 }
 
-async function graphql(
-  admin: AdminApiContext,
-  query: string,
-  variables: Record<string, unknown> = {}
-): Promise<any> {
-  return admin.graphql(query, { variables });
-}
-
 // ─── Step 1: Fetch order IDs ─────────────────────────────────────────────────
 
 function buildQueryString(status: string, options?: DateRangeOptions): string {
@@ -161,16 +155,17 @@ async function fetchOrderIds(
   const queryString = buildQueryString(status, options);
 
   while (hasNextPage) {
-    const data = await graphql(
-      admin,
+    const response: any = await admin.graphql(
       `query($cursor: String, $query: String!) {
         orders(first: ${ORDERS_PER_PAGE}, after: $cursor, query: $query, sortKey: CREATED_AT, reverse: true) {
           pageInfo { hasNextPage, endCursor }
           edges { node { id, createdAt } }
         }
       }`,
-      { cursor, query: queryString }
+      { variables: { cursor, query: queryString } }
     );
+
+    const data: any = await response.json();
 
     if (data.errors) break;
     const orders = data.data?.orders;
@@ -207,9 +202,8 @@ async function fetchFulfillmentData(
     const batch = orderIds.slice(i, i + CONCURRENT_REQUESTS);
 
     const results = await Promise.allSettled(
-      batch.map((orderId) =>
-        graphql(
-          admin,
+      batch.map(async (orderId) => {
+        const response: any = await admin.graphql(
           `query($orderId: ID!) {
             order(id: $orderId) {
               id
@@ -240,9 +234,11 @@ async function fetchFulfillmentData(
               }
             }
           }`,
-          { orderId }
-        )
-      )
+          { variables: { orderId } }
+        );
+        const data: any = await response.json();
+        return data;
+      })
     );
 
     for (const result of results) {
@@ -284,12 +280,7 @@ async function fetchFulfillmentData(
         };
       } | undefined;
 
-      if (!order) {
-        console.log("No order data in response");
-        continue;
-      }
-
-      const foCount = order.fulfillmentOrders?.edges?.length ?? 0;
+      if (!order) continue;
 
       if (!order.fulfillmentOrders?.edges) {
         ordersWithoutFOs++;
