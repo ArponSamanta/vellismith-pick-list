@@ -97,18 +97,27 @@ const ORDERS_PER_PAGE = 250;
  * Number of orders alias-batched into a single GraphQL request for the
  * fulfillment-order data pass. One batch's Shopify query cost:
  *   ORDERS_PER_BATCH × (1 + FO_PER_ORDER + FO_PER_ORDER × ITEMS_PER_FO)
- *   = 10 × (1 + 3 + 3 × 30) = 10 × 94 = 940 — safely under Shopify's
- *   1 000-point per-call budget.
+ *   = 5 × (1 + 2 + 2 × 20) = 5 × 43 = 215 points.
  *
- * Reduce ORDERS_PER_BATCH (or FO_PER_ORDER / ITEMS_PER_FO) if Shopify
- * starts returning THROTTLED / query-cost errors.
+ * What actually matters for throttling is the *concurrent* cost, since the
+ * leaky bucket (1 000 points, refilling ~50/sec on a standard store) is shared
+ * across in-flight requests:
+ *   CONCURRENT_BATCHES × 215 = 2 × 215 = 430  — comfortably under 1 000.
+ *
+ * The previous values (10/3/30 × 3 concurrent) demanded 3 × 940 = 2 820 points
+ * at once against a 1 000 bucket, which is exactly why batches were throttled.
+ * graphqlWithRetry now recovers from any residual throttle, but keeping the
+ * steady-state demand under budget avoids the retries entirely.
+ *
+ * Reduce these further if Shopify still returns THROTTLED / query-cost errors;
+ * raise ITEMS_PER_FO / FO_PER_ORDER only if orders start truncating.
  */
-const ORDERS_PER_BATCH = 10;
-const FO_PER_ORDER = 3;  // fulfillmentOrders(first:) — Vellismith is single-location so 1 is typical
-const ITEMS_PER_FO = 30; // lineItems(first:) per FO — plenty for jewelry orders (typically 1-10)
+const ORDERS_PER_BATCH = 5;
+const FO_PER_ORDER = 2;  // fulfillmentOrders(first:) — Vellismith is single-location so 1 is typical
+const ITEMS_PER_FO = 20; // lineItems(first:) per FO — plenty for jewelry orders (typically 1-10)
 
 /** Alias-batch requests to fire in parallel per round. */
-const CONCURRENT_BATCHES = 3;
+const CONCURRENT_BATCHES = 2;
 
 // ─── Exported API ─────────────────────────────────────────────────────────────
 
@@ -243,9 +252,14 @@ function buildQueryString(status: string, options?: DateRangeOptions): string {
 
 /**
  * In-memory guard using the same IST-aware UTC boundaries as the API query.
- * Catches any overfetch that can happen at pagination cursor boundaries
- * (rare, but possible when an order is created between the time the query
- * runs and the cursor advances).
+ * Catches any overfetch that can happen at pagination cursor boundaries, and —
+ * more importantly — acts as a hard backstop if Shopify's API-side date filter
+ * ever fails to apply, so out-of-range orders can never inflate the pick list.
+ *
+ * Comparison is done on epoch milliseconds (via Date.parse), NOT on the raw
+ * ISO strings. Shopify may return createdAt as "...Z" or with a "+05:30"
+ * offset; comparing two differently-formatted ISO strings lexicographically is
+ * unreliable near midnight boundaries, whereas epoch comparison is exact.
  */
 function isWithinDateRange(
   createdAt: string,
@@ -253,9 +267,86 @@ function isWithinDateRange(
   endDate?: string
 ): boolean {
   if (!startDate && !endDate) return true;
-  if (startDate && createdAt < localDateToUTCString(startDate, false)) return false;
-  if (endDate && createdAt >= localDateToUTCString(endDate, true)) return false;
+  const t = Date.parse(createdAt);
+  if (Number.isNaN(t)) return true; // unparseable — don't drop it on the guard's account
+  if (startDate && t < Date.parse(localDateToUTCString(startDate, false))) return false;
+  if (endDate && t >= Date.parse(localDateToUTCString(endDate, true))) return false;
   return true;
+}
+
+// ─── Throttle-aware GraphQL ──────────────────────────────────────────────────
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Max times a single throttled request is retried before we give up on it. */
+const MAX_THROTTLE_RETRIES = 6;
+
+/**
+ * Wraps admin.graphql with automatic retry on Shopify rate-limit throttling.
+ *
+ * Shopify surfaces a throttle two different ways and we must handle both:
+ *   1. The client THROWS a GraphqlQueryError whose message contains "Throttled".
+ *   2. The client RETURNS a 200 body carrying errors[].extensions.code ===
+ *      "THROTTLED" alongside extensions.cost.throttleStatus.
+ *
+ * When throttleStatus is present we wait exactly long enough for the leaky
+ * bucket to refill the missing points; otherwise we fall back to capped
+ * exponential backoff with jitter. Previously a throttled batch was caught and
+ * silently skipped, so its orders never reached the pick list — producing an
+ * incomplete list that looked like a broken date filter.
+ */
+async function graphqlWithRetry(
+  admin: AdminApiContext,
+  query: string,
+  variables?: Record<string, unknown>
+): Promise<any> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const response: any = await admin.graphql(
+        query,
+        variables ? { variables } : undefined
+      );
+      const data: any = await response.json();
+
+      const throttled =
+        Array.isArray(data?.errors) &&
+        data.errors.some((e: any) => e?.extensions?.code === "THROTTLED");
+
+      if (throttled && attempt < MAX_THROTTLE_RETRIES) {
+        await sleep(throttleWaitMs(data, attempt));
+        continue;
+      }
+      return data;
+    } catch (error: any) {
+      const isThrottle = /throttl/i.test(error?.message ?? "");
+      if (isThrottle && attempt < MAX_THROTTLE_RETRIES) {
+        console.warn(
+          `[picklist] throttled (thrown), retry ${attempt + 1}/${MAX_THROTTLE_RETRIES}`
+        );
+        await sleep(throttleWaitMs(null, attempt));
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+/**
+ * How long to wait before retrying a throttled request. Prefers Shopify's own
+ * throttleStatus (which tells us the exact refill time) and otherwise falls
+ * back to capped exponential backoff with a little jitter.
+ */
+function throttleWaitMs(data: any, attempt: number): number {
+  const cost = data?.extensions?.cost;
+  const status = cost?.throttleStatus;
+  if (status && typeof status.currentlyAvailable === "number") {
+    const needed = cost.requestedQueryCost ?? 0;
+    const deficit = needed - status.currentlyAvailable;
+    const restoreRate = status.restoreRate || 50;
+    if (deficit > 0) return Math.ceil((deficit / restoreRate) * 1000) + 250;
+  }
+  const backoff = Math.min(1000 * 2 ** attempt, 8000);
+  return backoff + Math.floor(Math.random() * 300);
 }
 
 // ─── Phase 1: collect order IDs (IDs + createdAt only) ───────────────────────
@@ -268,10 +359,14 @@ async function fetchOrderIds(
   const ids: string[] = [];
   let cursor: string | null = null;
   let hasNextPage = true;
+  let totalFetched = 0; // how many the API returned, before the in-memory guard
+  let sampleCreatedAt: string | null = null;
   const queryString = buildQueryString(status, options);
+  console.log(`[picklist] fetchOrderIds(${status}) query: ${queryString}`);
 
   while (hasNextPage) {
-    const response: any = await admin.graphql(
+    const data: any = await graphqlWithRetry(
+      admin,
       `query GetOrderIds($cursor: String, $query: String!) {
         orders(
           first: ${ORDERS_PER_PAGE},
@@ -284,10 +379,8 @@ async function fetchOrderIds(
           edges { node { id createdAt } }
         }
       }`,
-      { variables: { cursor, query: queryString } }
+      { cursor, query: queryString }
     );
-
-    const data: any = await response.json();
 
     if (data.errors) {
       console.error(`[picklist] fetchOrderIds(${status}) errors:`, data.errors);
@@ -298,6 +391,8 @@ async function fetchOrderIds(
     if (!orders) break;
 
     for (const { node } of orders.edges) {
+      totalFetched++;
+      if (sampleCreatedAt === null) sampleCreatedAt = node.createdAt;
       // In-memory IST-aware guard for exact boundary correctness.
       if (!isWithinDateRange(node.createdAt, options?.startDate, options?.endDate)) continue;
       ids.push(node.id);
@@ -307,7 +402,14 @@ async function fetchOrderIds(
     cursor = orders.pageInfo.endCursor;
   }
 
-  console.log(`[picklist] fetchOrderIds(${status}): ${ids.length} IDs`);
+  // If a date range is set and totalFetched >> ids.length, Shopify's API-side
+  // filter isn't applying and the in-memory guard is doing all the work — the
+  // sample createdAt reveals the format so we can tell why.
+  console.log(
+    `[picklist] fetchOrderIds(${status}): API returned ${totalFetched}, ` +
+    `kept ${ids.length} after date guard` +
+    (sampleCreatedAt ? ` (sample createdAt: ${sampleCreatedAt})` : "")
+  );
   return ids;
 }
 
@@ -385,16 +487,16 @@ async function fetchFulfillmentData(
 
     const results = await Promise.allSettled(
       concurrent.map(async (batchIds) => {
-        const query = buildBatchQuery(batchIds);
-        const response: any = await admin.graphql(query);
-        const data: any = await response.json();
+        const data: any = await graphqlWithRetry(admin, buildBatchQuery(batchIds));
         return { data, count: batchIds.length };
       })
     );
 
     for (const result of results) {
       if (result.status === "rejected") {
-        console.error("[picklist] batch request rejected:", result.reason);
+        // With graphqlWithRetry a throttle no longer lands here; a rejection
+        // now means a genuine (non-throttle) failure worth surfacing loudly.
+        console.error("[picklist] batch request failed after retries:", result.reason);
         continue;
       }
 
