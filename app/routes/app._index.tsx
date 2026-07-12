@@ -9,6 +9,18 @@ import { useFetcher } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
+// NOTE: import these statically, NOT via `await import(...)`. picklist.server is
+// server-only (`.server.ts`), so there's no client-bundle reason to defer it.
+// With a dynamic import, rollup can't see that this action calls generatePickList
+// WITH a date-bearing options object; combined with api.pick-list.ts calling it
+// without options, rollup "proves" options.startDate is always falsy and
+// dead-code-eliminates the entire created_at date filter from buildQueryString.
+// A static import keeps this dated call site analyzable so the filter survives.
+import {
+  generatePickList,
+  formatPickListAsText,
+  filterByProductName,
+} from "../utils/picklist.server";
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
@@ -19,8 +31,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin } = await authenticate.admin(request);
-  const { generatePickList, formatPickListAsText, filterByProductName } =
-    await import("../utils/picklist.server");
 
   try {
     const formData = await request.formData();
