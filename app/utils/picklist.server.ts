@@ -222,16 +222,21 @@ function localDateToUTCString(dateStr: string, isExclusiveEnd: boolean): string 
   const localMidnightUTC = Date.parse(`${dateStr}T00:00:00Z`) - offsetMs;
   // For the exclusive end advance by exactly one local day (86 400 s).
   const adjustedMs = localMidnightUTC + (isExclusiveEnd ? 86_400_000 : 0);
-  return new Date(adjustedMs).toISOString();
+  // Shopify's search DSL expects second-precision timestamps; strip the
+  // milliseconds toISOString() always adds.
+  return new Date(adjustedMs).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
 function buildQueryString(status: string, options?: DateRangeOptions): string {
   const conditions = [`fulfillment_status:${status}`];
+  // Shopify's search query DSL requires single quotes around datetime
+  // comparison values — double quotes cause the created_at clause to be
+  // silently mis-parsed (it's treated as a phrase, not a date comparison).
   if (options?.startDate) {
-    conditions.push(`created_at:>="${localDateToUTCString(options.startDate, false)}"`);
+    conditions.push(`created_at:>='${localDateToUTCString(options.startDate, false)}'`);
   }
   if (options?.endDate) {
-    conditions.push(`created_at:<"${localDateToUTCString(options.endDate, true)}"`);
+    conditions.push(`created_at:<'${localDateToUTCString(options.endDate, true)}'`);
   }
   return conditions.join(" AND ");
 }
