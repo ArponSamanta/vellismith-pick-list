@@ -127,17 +127,24 @@ export async function generatePickList(
 ): Promise<PickListProduct[]> {
   try {
     // Phase 1 — lightweight ID fetch for both order statuses concurrently.
-    // "unshipped" = nothing fulfilled yet; "partial" = some done, some pending.
-    const [unshippedIds, partialIds] = await Promise.all([
-      fetchOrderIds(admin, "unshipped", options),
+    // "unfulfilled" = nothing fulfilled yet; "partial" = some done, some pending.
+    // These two match Shopify Admin's "Unfulfilled" + "Partially fulfilled"
+    // filters exactly — every order that still owes the customer items to pick.
+    //
+    // NOTE: this previously used "unshipped", which is a DIFFERENT, narrower
+    // Shopify search value (marked-for-fulfillment-but-not-shipped). It silently
+    // missed genuinely unfulfilled orders, so any date-scoped query could come
+    // back empty even when the Admin clearly showed unfulfilled orders in range.
+    const [unfulfilledIds, partialIds] = await Promise.all([
+      fetchOrderIds(admin, "unfulfilled", options),
       fetchOrderIds(admin, "partial", options),
     ]);
 
-    // An order can't be both unshipped AND partial at the same time, but
+    // An order can't be both unfulfilled AND partial at the same time, but
     // deduplication is cheap and guards against any unexpected overlap.
-    const allIds = [...new Set([...unshippedIds, ...partialIds])];
+    const allIds = [...new Set([...unfulfilledIds, ...partialIds])];
     console.log(
-      `[picklist] phase 1 — ${unshippedIds.length} unshipped + ` +
+      `[picklist] phase 1 — ${unfulfilledIds.length} unfulfilled + ` +
       `${partialIds.length} partial = ${allIds.length} unique orders`
     );
 
