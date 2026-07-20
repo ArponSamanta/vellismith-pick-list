@@ -245,14 +245,21 @@ function localDateToUTCString(dateStr: string, isExclusiveEnd: boolean): string 
 
 function buildQueryString(status: string, options?: DateRangeOptions): string {
   const conditions = [`fulfillment_status:${status}`];
-  // Shopify's search query DSL requires single quotes around datetime
-  // comparison values — double quotes cause the created_at clause to be
-  // silently mis-parsed (it's treated as a phrase, not a date comparison).
+  // Filter on processed_at, NOT created_at. Shopify Admin's Orders list "Date"
+  // column and its date filter use the order's *processed* date (processed_at).
+  // For orders imported/migrated into the store (or created by some checkout
+  // apps), created_at is the date the Shopify record was created — often the
+  // import date — while processed_at is the real order date the merchant sees.
+  // Filtering on created_at silently misses those orders (e.g. a May range came
+  // back empty because those orders' created_at was the July import date).
+  //
+  // Single quotes are required around the datetime value — double quotes cause
+  // the clause to be mis-parsed as a phrase rather than a date comparison.
   if (options?.startDate) {
-    conditions.push(`created_at:>='${localDateToUTCString(options.startDate, false)}'`);
+    conditions.push(`processed_at:>='${localDateToUTCString(options.startDate, false)}'`);
   }
   if (options?.endDate) {
-    conditions.push(`created_at:<'${localDateToUTCString(options.endDate, true)}'`);
+    conditions.push(`processed_at:<'${localDateToUTCString(options.endDate, true)}'`);
   }
   return conditions.join(" AND ");
 }
@@ -263,19 +270,21 @@ function buildQueryString(status: string, options?: DateRangeOptions): string {
  * more importantly — acts as a hard backstop if Shopify's API-side date filter
  * ever fails to apply, so out-of-range orders can never inflate the pick list.
  *
- * Comparison is done on epoch milliseconds (via Date.parse), NOT on the raw
- * ISO strings. Shopify may return createdAt as "...Z" or with a "+05:30"
- * offset; comparing two differently-formatted ISO strings lexicographically is
- * unreliable near midnight boundaries, whereas epoch comparison is exact.
+ * `orderDate` is the order's processed_at (the field we filter on), passed in
+ * as the raw ISO string Shopify returned. Comparison is done on epoch
+ * milliseconds (via Date.parse), NOT on the raw ISO strings: Shopify may return
+ * the timestamp as "...Z" or with a "+05:30" offset, and comparing two
+ * differently-formatted ISO strings lexicographically is unreliable near
+ * midnight boundaries, whereas epoch comparison is exact.
  */
 function isWithinDateRange(
-  createdAt: string,
+  orderDate: string,
   startDate?: string,
   endDate?: string
 ): boolean {
   if (!startDate && !endDate) return true;
-  const t = Date.parse(createdAt);
-  if (Number.isNaN(t)) return true; // unparseable — don't drop it on the guard's account
+  const t = Date.parse(orderDate);
+  if (Number.isNaN(t)) return true; // unparseable/null — don't drop it on the guard's account
   if (startDate && t < Date.parse(localDateToUTCString(startDate, false))) return false;
   if (endDate && t >= Date.parse(localDateToUTCString(endDate, true))) return false;
   return true;
@@ -356,7 +365,7 @@ function throttleWaitMs(data: any, attempt: number): number {
   return backoff + Math.floor(Math.random() * 300);
 }
 
-// ─── Phase 1: collect order IDs (IDs + createdAt only) ───────────────────────
+// ─── Phase 1: collect order IDs (IDs + dates only) ───────────────────────────
 
 async function fetchOrderIds(
   admin: AdminApiContext,
@@ -367,7 +376,7 @@ async function fetchOrderIds(
   let cursor: string | null = null;
   let hasNextPage = true;
   let totalFetched = 0; // how many the API returned, before the in-memory guard
-  let sampleCreatedAt: string | null = null;
+  let sampleDates: string | null = null;
   const queryString = buildQueryString(status, options);
   console.log(`[picklist] fetchOrderIds(${status}) query: ${queryString}`);
 
@@ -379,11 +388,11 @@ async function fetchOrderIds(
           first: ${ORDERS_PER_PAGE},
           after: $cursor,
           query: $query,
-          sortKey: CREATED_AT,
+          sortKey: PROCESSED_AT,
           reverse: true
         ) {
           pageInfo { hasNextPage endCursor }
-          edges { node { id createdAt } }
+          edges { node { id createdAt processedAt } }
         }
       }`,
       { cursor, query: queryString }
@@ -399,9 +408,11 @@ async function fetchOrderIds(
 
     for (const { node } of orders.edges) {
       totalFetched++;
-      if (sampleCreatedAt === null) sampleCreatedAt = node.createdAt;
-      // In-memory IST-aware guard for exact boundary correctness.
-      if (!isWithinDateRange(node.createdAt, options?.startDate, options?.endDate)) continue;
+      if (sampleDates === null) {
+        sampleDates = `processedAt=${node.processedAt} createdAt=${node.createdAt}`;
+      }
+      // In-memory IST-aware guard on the SAME field we filter by (processed_at).
+      if (!isWithinDateRange(node.processedAt, options?.startDate, options?.endDate)) continue;
       ids.push(node.id);
     }
 
@@ -411,11 +422,11 @@ async function fetchOrderIds(
 
   // If a date range is set and totalFetched >> ids.length, Shopify's API-side
   // filter isn't applying and the in-memory guard is doing all the work — the
-  // sample createdAt reveals the format so we can tell why.
+  // sample dates reveal which field/format so we can tell why.
   console.log(
     `[picklist] fetchOrderIds(${status}): API returned ${totalFetched}, ` +
     `kept ${ids.length} after date guard` +
-    (sampleCreatedAt ? ` (sample createdAt: ${sampleCreatedAt})` : "")
+    (sampleDates ? ` (sample ${sampleDates})` : "")
   );
   return ids;
 }
