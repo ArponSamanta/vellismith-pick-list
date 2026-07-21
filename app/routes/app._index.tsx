@@ -24,6 +24,29 @@ import {
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
+/**
+ * Shopify only exposes orders from the last 60 days to an app unless that app
+ * has been granted the `read_all_orders` scope (which Shopify must approve).
+ * Beyond that window the API returns nothing at all — the orders are still
+ * visible in the Shopify Admin, which makes an empty pick list look like a bug.
+ * Rather than render a bare "No products to pick", say exactly why.
+ */
+const ORDER_HISTORY_DAYS = 60;
+
+function orderHistoryWarning(startDate?: string | null): string | undefined {
+  if (!startDate) return undefined;
+  const cutoffMs = Date.now() - ORDER_HISTORY_DAYS * 86_400_000;
+  const start = Date.parse(`${startDate}T00:00:00Z`);
+  if (Number.isNaN(start) || start >= cutoffMs) return undefined;
+  const cutoff = new Date(cutoffMs).toISOString().slice(0, 10);
+  return (
+    `Shopify only lets this app read orders from the last ${ORDER_HISTORY_DAYS} days ` +
+    `(back to ${cutoff}). Orders placed before that date can't be fetched yet, so ` +
+    `they won't appear here — even though you can still see them in your Shopify ` +
+    `admin. Granting the app the "read all orders" permission unlocks the full history.`
+  );
+}
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
   return null;
@@ -59,7 +82,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       showVariantQuantity,
     });
 
-    return { pickList, formattedText, success: true };
+    return {
+      pickList,
+      formattedText,
+      success: true,
+      historyWarning: orderHistoryWarning(startDate),
+    };
   } catch (error) {
     console.error("Error generating pick list:", error);
     return {
@@ -142,6 +170,12 @@ export default function Index() {
     fetcher.formMethod === "POST";
 
   const pickList: any[] = fetcher.data?.pickList ?? [];
+  // Present only when the requested start date reaches past Shopify's 60-day
+  // order-history limit (see orderHistoryWarning above).
+  const historyWarning: string | undefined =
+    fetcher.data && "historyWarning" in fetcher.data
+      ? (fetcher.data.historyWarning as string | undefined)
+      : undefined;
   const totalProducts = pickList.length;
   const totalItems = pickList.reduce(
     (sum: number, p: any) => sum + p.totalQuantity,
@@ -958,6 +992,24 @@ export default function Index() {
             </div>
           </form>
         </div>
+
+        {/* ── Order-history limit notice ──────────────────────────── */}
+        {/* Shown when the chosen start date predates Shopify's 60-day window, */}
+        {/* so an empty (or short) list reads as a permission limit, not a bug. */}
+        {historyWarning && (
+          <div
+            style={{
+              padding: "16px",
+              backgroundColor: "var(--s-color-bg-warning)",
+              border: "1px solid var(--s-color-border-subdued)",
+              borderRadius: "8px",
+              marginTop: "16px",
+              animation: "fadeIn 0.3s ease-out",
+            }}
+          >
+            <s-paragraph>⚠️ {historyWarning}</s-paragraph>
+          </div>
+        )}
 
         {/* ── Results ─────────────────────────────────────────────── */}
         {fetcher.data?.success && pickList.length > 0 && (

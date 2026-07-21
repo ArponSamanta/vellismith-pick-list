@@ -148,14 +148,6 @@ export async function generatePickList(
       `${partialIds.length} partial = ${allIds.length} unique orders`
     );
 
-    // TEMP DIAGNOSTIC — remove once the date-field question is settled.
-    // When a date range returns nothing, dump the real date fields of the
-    // specific orders the Admin shows in that range, plus the newest few
-    // unfulfilled orders, so we can see WHICH field Shopify is filtering on.
-    if (allIds.length === 0 && (options?.startDate || options?.endDate)) {
-      await diagnoseOrderDates(admin);
-    }
-
     if (allIds.length === 0) return [];
 
     // Phase 2 — fetch fulfillment order data (remainingQuantity) in alias batches.
@@ -371,53 +363,6 @@ function throttleWaitMs(data: any, attempt: number): number {
   }
   const backoff = Math.min(1000 * 2 ** attempt, 8000);
   return backoff + Math.floor(Math.random() * 300);
-}
-
-// ─── TEMP DIAGNOSTIC ─────────────────────────────────────────────────────────
-// Remove once we know which date field Shopify Admin filters the order list by.
-// Dumps every timestamp field for (a) the specific orders seen in the Admin for
-// the failing May range, and (b) the newest unfulfilled orders, so we can see
-// whether the "order date" the merchant sees is createdAt, processedAt, or
-// something else entirely.
-async function diagnoseOrderDates(admin: AdminApiContext): Promise<void> {
-  const names = ["1150", "1149", "1122", "1102", "1071", "1066"];
-  // Match with and without the leading '#', since order-name search accepts both.
-  const byName = names.map((n) => `name:#${n} OR name:${n}`).join(" OR ");
-
-  const dump = (label: string, edges: any[]) => {
-    console.log(`[picklist][diag] ${label}: ${edges.length} orders`);
-    for (const { node } of edges) {
-      console.log(
-        `[picklist][diag]   ${node.name} status=${node.displayFulfillmentStatus} ` +
-        `createdAt=${node.createdAt} processedAt=${node.processedAt} updatedAt=${node.updatedAt}`
-      );
-    }
-  };
-
-  try {
-    const named: any = await graphqlWithRetry(
-      admin,
-      `query Diag($query: String!) {
-        orders(first: 15, query: $query) {
-          edges { node { name displayFulfillmentStatus createdAt processedAt updatedAt } }
-        }
-      }`,
-      { query: byName }
-    );
-    dump(`named orders (${byName})`, named?.data?.orders?.edges ?? []);
-
-    const newest: any = await graphqlWithRetry(
-      admin,
-      `query DiagNewest {
-        orders(first: 5, query: "fulfillment_status:unfulfilled", sortKey: PROCESSED_AT, reverse: true) {
-          edges { node { name displayFulfillmentStatus createdAt processedAt updatedAt } }
-        }
-      }`
-    );
-    dump("newest unfulfilled", newest?.data?.orders?.edges ?? []);
-  } catch (e) {
-    console.error("[picklist][diag] failed:", e);
-  }
 }
 
 // ─── Phase 1: collect order IDs (IDs + dates only) ───────────────────────────
