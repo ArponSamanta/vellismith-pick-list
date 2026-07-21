@@ -20,6 +20,7 @@ import {
   generatePickList,
   formatPickListAsText,
   filterByProductName,
+  fetchGrantedScopes,
 } from "../utils/picklist.server";
 
 // ─── Server ──────────────────────────────────────────────────────────────────
@@ -33,17 +34,24 @@ import {
  */
 const ORDER_HISTORY_DAYS = 60;
 
-function orderHistoryWarning(startDate?: string | null): string | undefined {
-  if (!startDate) return undefined;
-  const cutoffMs = Date.now() - ORDER_HISTORY_DAYS * 86_400_000;
+/** True when the requested start date reaches past Shopify's 60-day window. */
+function reachesPastHistoryWindow(startDate?: string | null): boolean {
+  if (!startDate) return false;
   const start = Date.parse(`${startDate}T00:00:00Z`);
-  if (Number.isNaN(start) || start >= cutoffMs) return undefined;
-  const cutoff = new Date(cutoffMs).toISOString().slice(0, 10);
+  if (Number.isNaN(start)) return false;
+  return start < Date.now() - ORDER_HISTORY_DAYS * 86_400_000;
+}
+
+function orderHistoryWarning(): string {
+  const cutoff = new Date(Date.now() - ORDER_HISTORY_DAYS * 86_400_000)
+    .toISOString()
+    .slice(0, 10);
   return (
     `Shopify only lets this app read orders from the last ${ORDER_HISTORY_DAYS} days ` +
-    `(back to ${cutoff}). Orders placed before that date can't be fetched yet, so ` +
-    `they won't appear here — even though you can still see them in your Shopify ` +
-    `admin. Granting the app the "read all orders" permission unlocks the full history.`
+    `(back to ${cutoff}). Orders placed before that date can't be fetched, so they ` +
+    `won't appear here — even though you can still see them in your Shopify admin. ` +
+    `This app is still waiting on the "read all orders" permission, which Shopify ` +
+    `must approve and which needs the app to be re-installed once granted.`
   );
 }
 
@@ -82,12 +90,20 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       showVariantQuantity,
     });
 
-    return {
-      pickList,
-      formattedText,
-      success: true,
-      historyWarning: orderHistoryWarning(startDate),
-    };
+    // Only warn about the 60-day limit when the range actually reaches past it
+    // AND the app genuinely lacks read_all_orders — otherwise a correctly
+    // permissioned app would keep nagging about a limit that no longer applies.
+    // Also logs the live granted scopes, which is the only reliable way to tell
+    // whether a SCOPES change has actually taken effect on the access token.
+    let historyWarning: string | undefined;
+    if (reachesPastHistoryWindow(startDate)) {
+      const grantedScopes = await fetchGrantedScopes(admin);
+      if (!grantedScopes.includes("read_all_orders")) {
+        historyWarning = orderHistoryWarning();
+      }
+    }
+
+    return { pickList, formattedText, success: true, historyWarning };
   } catch (error) {
     console.error("Error generating pick list:", error);
     return {

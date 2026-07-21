@@ -161,6 +161,38 @@ export async function generatePickList(
   }
 }
 
+/**
+ * Returns the access scopes actually GRANTED to this app installation.
+ *
+ * This is deliberately read from Shopify rather than from the SCOPES env var:
+ * the env var is only what we *request*. The scopes a token actually carries
+ * change only when the merchant re-authorises the app, and `read_all_orders`
+ * additionally requires Shopify to approve it for the app first. So the env var
+ * can list read_all_orders while the live token still lacks it — which looks
+ * exactly like "the 60-day limit is still broken".
+ */
+export async function fetchGrantedScopes(
+  admin: AdminApiContext
+): Promise<string[]> {
+  try {
+    const data: any = await graphqlWithRetry(
+      admin,
+      `query GrantedScopes { currentAppInstallation { accessScopes { handle } } }`
+    );
+    const scopes: string[] = (
+      data?.data?.currentAppInstallation?.accessScopes ?? []
+    ).map((s: any) => s.handle);
+    console.log(`[picklist] granted scopes (${scopes.length}): ${scopes.join(", ")}`);
+    console.log(
+      `[picklist] read_all_orders granted: ${scopes.includes("read_all_orders")}`
+    );
+    return scopes;
+  } catch (error) {
+    console.error("[picklist] could not read granted scopes:", error);
+    return [];
+  }
+}
+
 export function filterByProductName(
   pickList: PickListProduct[],
   searchKeyword?: string
