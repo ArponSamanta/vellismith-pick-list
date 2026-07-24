@@ -474,49 +474,63 @@ export default function Index() {
     if (!pickList.length) return;
     // Commit the chosen layout before we read the print section's markup.
     flushSync(() => setPrintMode(mode));
+
+    // Printing needs a real top-level browser document. In-frame window.print()
+    // prints the wrong frame, and the Shopify NATIVE mobile app's WebView blocks
+    // both printing and opening a document outright — there is no web print API
+    // there. So if we can't open the document, tell the user how to print.
+    const cannotPrint = () =>
+      shopify.toast.show(
+        "Printing isn't available inside the Shopify mobile app. Open your store in a browser (desktop, or Safari/Chrome on your phone) to print or save as PDF.",
+        { isError: true, duration: 6000 }
+      );
+
     const src = document.getElementById("pick-list-print");
     if (!src) {
-      window.print();
+      cannotPrint();
+      return;
+    }
+    const win = window.open("", "_blank");
+    if (!win) {
+      cannotPrint();
       return;
     }
 
-    // Open the list as its own standalone document in a new tab. This is far
-    // more reliable than window.print() from inside Shopify's embedded frame:
-    // mobile app WebViews routinely ignore an in-frame print (nothing happens),
-    // and even mobile browsers can print the wrong frame. A real top-level page
-    // gives the user native Print / Save-as-PDF / share on every platform.
-    const win = window.open("", "_blank");
-    if (!win) {
-      // Popups blocked or a single-window WebView — best-effort in-frame print.
-      window.print();
-      return;
+    try {
+      const title = mode === "manufacturing" ? "Manufacturing list" : "Tracking list";
+      win.document.open();
+      win.document.write(
+        '<!doctype html><html><head><meta charset="utf-8">' +
+          '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+          "<title>Pick List — " + title + "</title><style>" +
+          PRINT_DOC_TOKENS +
+          "html,body{margin:0;background:#fff;color:#201e1d;font-family:var(--font-body);}" +
+          PRINT_LIST_CSS +
+          "#pick-list-print{padding:18px;}" +
+          ".pk-bar{position:sticky;top:0;z-index:9;display:flex;gap:8px;padding:12px 16px;" +
+          "background:#f3f2f2;border-bottom:2px solid #201e1d;}" +
+          ".pk-bar button{font-family:var(--font-heading);font-weight:800;font-size:14px;" +
+          "padding:11px 18px;border:1px solid #201e1d;background:#ec3013;color:#fff;cursor:pointer;}" +
+          "@media print{.pk-bar{display:none;}#pick-list-print{padding:0;}}" +
+          "@page{size:A4 portrait;margin:10mm;}" +
+          "</style></head><body>" +
+          '<div class="pk-bar"><button onclick="window.print()">Print / Save as PDF</button></div>' +
+          src.outerHTML +
+          // Auto-open the print dialog once images have loaded; the button is the
+          // fallback if a browser blocks the automatic call.
+          "<scr" + "ipt>window.addEventListener('load',function(){" +
+          "setTimeout(function(){try{window.focus();window.print();}catch(e){}},500);});</scr" + "ipt>" +
+          "</body></html>"
+      );
+      win.document.close();
+    } catch {
+      try {
+        win.close();
+      } catch {
+        /* ignore */
+      }
+      cannotPrint();
     }
-    const title = mode === "manufacturing" ? "Manufacturing list" : "Tracking list";
-    win.document.open();
-    win.document.write(
-      '<!doctype html><html><head><meta charset="utf-8">' +
-        '<meta name="viewport" content="width=device-width,initial-scale=1">' +
-        "<title>Pick List — " + title + "</title><style>" +
-        PRINT_DOC_TOKENS +
-        "html,body{margin:0;background:#fff;color:#201e1d;font-family:var(--font-body);}" +
-        PRINT_LIST_CSS +
-        "#pick-list-print{padding:18px;}" +
-        ".pk-bar{position:sticky;top:0;z-index:9;display:flex;gap:8px;padding:12px 16px;" +
-        "background:#f3f2f2;border-bottom:2px solid #201e1d;}" +
-        ".pk-bar button{font-family:var(--font-heading);font-weight:800;font-size:14px;" +
-        "padding:11px 18px;border:1px solid #201e1d;background:#ec3013;color:#fff;cursor:pointer;}" +
-        "@media print{.pk-bar{display:none;}#pick-list-print{padding:0;}}" +
-        "@page{size:A4 portrait;margin:10mm;}" +
-        "</style></head><body>" +
-        '<div class="pk-bar"><button onclick="window.print()">Print / Save as PDF</button></div>' +
-        src.outerHTML +
-        // Auto-open the print dialog once images have loaded; the button is the
-        // fallback if a browser blocks the automatic call.
-        "<scr" + "ipt>window.addEventListener('load',function(){" +
-        "setTimeout(function(){try{window.focus();window.print();}catch(e){}},500);});</scr" + "ipt>" +
-        "</body></html>"
-    );
-    win.document.close();
   };
 
   useEffect(() => {
@@ -607,7 +621,19 @@ export default function Index() {
           font-size: 15px;
           line-height: 1.55;
           min-height: 100vh;
+          /* Never let content push the page wider than the screen: a single
+             overflowing element (long SKU, order-id list, image) expands the
+             mobile layout viewport and stops the max-width media queries from
+             firing — which reads as "the desktop layout, zoomed out". */
+          max-width: 100%;
+          overflow-x: hidden;
         }
+        /* Long unbroken strings (SKUs, "[#1042, #1051, …]") wrap instead of
+           forcing horizontal overflow. */
+        .pk-app .pk-card-title,
+        .pk-app .pk-vars,
+        .pk-app .pk-card-body { overflow-wrap: anywhere; word-break: break-word; }
+        .pk-app img { max-width: 100%; }
         .pk-app h1, .pk-app h2, .pk-app h3, .pk-app h4 {
           font-family: var(--font-heading); font-weight: 800;
           line-height: 1.12; letter-spacing: -0.015em; margin: 0 0 8px;
