@@ -251,6 +251,12 @@ const IconX = ({ size = 15, sw = 2, stroke = "currentColor" }: IconProps) => (
     <path d="m6 6 12 12" />
   </svg>
 );
+const IconSearch = ({ size = 15, sw = 2, stroke = "currentColor" }: IconProps) => (
+  <svg {...iconAttrs(size, sw, stroke)}>
+    <circle cx="11" cy="11" r="8" />
+    <path d="m21 21-4.3-4.3" />
+  </svg>
+);
 const IconPrinter = ({ size = 16, stroke = "currentColor" }: IconProps) => (
   <svg {...iconAttrs(size, 2, stroke)}>
     <path d="M12 16h.01" />
@@ -309,7 +315,11 @@ export default function Index() {
   // just reshapes the already-fetched list, so switching variants is instant.
   const [selectedVariants, setSelectedVariants] = useState<string[]>([]);
   const [variantMenuOpen, setVariantMenuOpen] = useState(false);
+  // Free-text filter for the (potentially long) variant dropdown. Default is
+  // empty = show every variant; typing narrows the list client-side.
+  const [variantSearch, setVariantSearch] = useState("");
   const variantMenuRef = useRef<HTMLDivElement>(null);
+  const variantSearchRef = useRef<HTMLInputElement>(null);
   // Which layout @media print should reveal (set on data-print-mode).
   const [printMode, setPrintMode] = useState<"tracking" | "manufacturing">(
     "manufacturing"
@@ -339,6 +349,14 @@ export default function Index() {
       a.toLowerCase().localeCompare(b.toLowerCase())
     );
   }, [rawPickList]);
+
+  // The variant options actually shown in the dropdown, narrowed by the search
+  // box. Empty search = every variant (the default).
+  const filteredVariantOptions: string[] = useMemo(() => {
+    const q = variantSearch.trim().toLowerCase();
+    if (!q) return variantOptions;
+    return variantOptions.filter((v) => v.toLowerCase().includes(q));
+  }, [variantOptions, variantSearch]);
 
   // The list actually rendered/printed. Collapse each product to the selected
   // variants (their union) and recalculate its total, then sort client-side so
@@ -392,6 +410,17 @@ export default function Index() {
       setSelectedVariants(stillPresent);
     }
   }, [variantOptions, selectedVariants]);
+
+  // When the menu closes, clear the search so it reopens showing all variants.
+  // When it opens, focus the search box for immediate typing (desktop).
+  useEffect(() => {
+    if (!variantMenuOpen) {
+      setVariantSearch("");
+      return;
+    }
+    const id = window.setTimeout(() => variantSearchRef.current?.focus(), 0);
+    return () => window.clearTimeout(id);
+  }, [variantMenuOpen]);
 
   // Close the variant menu on an outside click.
   useEffect(() => {
@@ -677,6 +706,36 @@ export default function Index() {
         }
         .pk-app :focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
 
+        /* ── Variant dropdown ───────────────────────────────────────────
+           Desktop: an anchored popover. Mobile: a bottom sheet (see the
+           mobile media query, which overrides these with !important). */
+        .pk-vmenu-backdrop { display: none; }
+        .pk-vmenu {
+          position: absolute; top: 100%; left: 0; right: 0; z-index: 30;
+          margin-top: 4px; display: flex; flex-direction: column;
+          max-height: 340px; background: var(--color-bg);
+          border: 1px solid var(--color-divider); box-shadow: var(--shadow-lg);
+        }
+        .pk-vmenu-head {
+          flex: none; padding: 8px; border-bottom: 1px solid var(--color-divider);
+          background: var(--color-bg);
+        }
+        .pk-vmenu-grip { display: none; }
+        .pk-vmenu-list { flex: 1 1 auto; overflow-y: auto; padding: 4px; }
+        .pk-vmenu-opt {
+          display: flex; align-items: flex-start; gap: 9px; padding: 9px 10px;
+          font-size: 14px; cursor: pointer; color: var(--color-text);
+        }
+        .pk-vmenu-opt:hover {
+          background: color-mix(in srgb, var(--color-text) 5%, transparent);
+        }
+        .pk-vmenu-foot {
+          flex: none; display: flex; align-items: center;
+          justify-content: space-between; gap: 10px;
+          padding: 8px 10px; border-top: 1px solid var(--color-divider);
+          background: var(--color-bg);
+        }
+
         /* tags */
         .pk-app .tag {
           display: inline-flex; align-items: center; font-size: 11px;
@@ -701,8 +760,21 @@ export default function Index() {
           /* Stats: keep three across but shrink the big numerals + padding. */
           .pk-stats > div { padding: 14px 12px !important; }
           .pk-stats > div > div:first-child { font-size: 26px !important; }
-          .pk-filter-grid { flex-direction: column !important; gap: 12px !important; }
-          .pk-filter-grid > * { flex: 1 1 100% !important; min-width: 0 !important; }
+          /* Stack filters into one clean full-width column. The base grid uses
+             align-items:flex-end (fine for a row); in a column that would pin
+             each field to the right at content width, so force stretch + full
+             width here. */
+          .pk-filter-grid {
+            flex-direction: column !important;
+            align-items: stretch !important;
+            gap: 14px !important;
+          }
+          .pk-filter-grid > * {
+            flex: 0 0 auto !important;
+            width: 100% !important;
+            min-width: 0 !important;
+          }
+          .pk-filter-grid .field > label { text-align: left !important; }
           .pk-toggles { flex-direction: column !important; align-items: stretch !important; gap: 16px !important; }
           /* Stack the display toggles into a tappable vertical list. */
           .pk-toggles > div { flex-direction: column !important; align-items: flex-start !important; gap: 14px !important; }
@@ -717,7 +789,37 @@ export default function Index() {
           /* Comfortable touch targets. */
           .pk-app .input, .pk-app .btn { min-height: 44px; }
           .pk-chk { width: 20px !important; height: 20px !important; }
+
+          /* Variant dropdown becomes a full-width bottom sheet for clean,
+             thumb-friendly interaction instead of a cramped popover. */
+          .pk-vmenu-backdrop {
+            display: block !important;
+            position: fixed !important; inset: 0 !important;
+            background: rgba(0, 0, 0, 0.4); z-index: 900 !important;
+            animation: pkFade 160ms ease;
+          }
+          .pk-vmenu {
+            position: fixed !important;
+            top: auto !important; left: 0 !important; right: 0 !important;
+            bottom: 0 !important; margin: 0 !important; z-index: 901 !important;
+            max-height: 78vh !important;
+            border: none !important; border-top: 2px solid var(--color-text) !important;
+            box-shadow: 0 -10px 34px rgba(0, 0, 0, 0.28) !important;
+            padding-bottom: env(safe-area-inset-bottom, 0px);
+            animation: pkSheet 240ms cubic-bezier(0.22, 1, 0.36, 1);
+          }
+          .pk-vmenu-head { padding: 8px 14px 12px !important; }
+          .pk-vmenu-grip {
+            display: block !important;
+            width: 40px; height: 4px; margin: 4px auto 12px;
+            border-radius: 999px;
+            background: color-mix(in srgb, var(--color-text) 22%, transparent);
+          }
+          .pk-vmenu-list { padding: 4px 6px !important; }
+          .pk-vmenu-opt { padding: 13px 12px !important; font-size: 15px !important; }
+          .pk-vmenu-foot { padding: 12px 14px !important; }
         }
+        @keyframes pkSheet { from { transform: translateY(100%); } to { transform: none; } }
         @media (max-width: 400px) {
           .pk-grid { grid-template-columns: 1fr !important; }
           .pk-header h1 { font-size: 28px !important; }
@@ -1051,74 +1153,132 @@ export default function Index() {
                     </button>
 
                     {variantMenuOpen && variantHasOptions && (
-                      <div
-                        role="listbox"
-                        aria-multiselectable="true"
-                        style={{
-                          position: "absolute",
-                          top: "100%",
-                          left: 0,
-                          right: 0,
-                          zIndex: 30,
-                          marginTop: "4px",
-                          maxHeight: "250px",
-                          overflowY: "auto",
-                          background: "var(--color-bg)",
-                          border: "1px solid var(--color-divider)",
-                          boxShadow: "var(--shadow-lg)",
-                          padding: "4px",
-                        }}
-                      >
-                        {selectedVariants.length > 0 && (
-                          <button
-                            type="button"
-                            onClick={() => setSelectedVariants([])}
-                            style={{
-                              width: "100%",
-                              textAlign: "left",
-                              padding: "8px 10px",
-                              background: "transparent",
-                              border: "none",
-                              color: "var(--color-accent)",
-                              fontFamily: "var(--font-heading)",
-                              fontWeight: 800,
-                              fontSize: "12px",
-                              cursor: "pointer",
-                            }}
-                          >
-                            Clear selection ({selectedVariants.length})
-                          </button>
-                        )}
-                        {variantOptions.map((vt) => (
-                          <label
-                            key={vt}
-                            role="option"
-                            aria-selected={selectedVariants.includes(vt)}
-                            style={{
-                              display: "flex",
-                              alignItems: "flex-start",
-                              gap: "9px",
-                              padding: "8px 10px",
-                              fontSize: "14px",
-                              cursor: "pointer",
-                              color: "var(--color-text)",
-                            }}
-                          >
-                            <input
-                              type="checkbox"
-                              className="pk-chk"
-                              checked={selectedVariants.includes(vt)}
-                              onChange={() => toggleVariant(vt)}
-                              style={{ marginTop: "2px" }}
-                            />
-                            {/* Full variant name — wrap onto multiple lines
-                                rather than clip, so nothing is hidden. */}
-                            <span style={{ whiteSpace: "normal", overflowWrap: "anywhere", lineHeight: 1.35 }}>
-                              {vt}
-                            </span>
-                          </label>
-                        ))}
-                      </div>
+                      <>
+                        {/* Dimmed backdrop — shown only on mobile, where the
+                            menu becomes a bottom sheet. Tap to close. */}
+                        <div
+                          className="pk-vmenu-backdrop"
+                          onClick={() => setVariantMenuOpen(false)}
+                          aria-hidden="true"
+                        />
+                        <div
+                          className="pk-vmenu"
+                          role="listbox"
+                          aria-multiselectable="true"
+                        >
+                          {/* Sticky header: grip (mobile) + search box. */}
+                          <div className="pk-vmenu-head">
+                            <div className="pk-vmenu-grip" aria-hidden="true" />
+                            <div style={{ position: "relative" }}>
+                              <span
+                                style={{
+                                  position: "absolute",
+                                  left: 10,
+                                  top: "50%",
+                                  transform: "translateY(-50%)",
+                                  opacity: 0.5,
+                                  display: "inline-flex",
+                                  pointerEvents: "none",
+                                }}
+                              >
+                                <IconSearch size={15} />
+                              </span>
+                              <input
+                                ref={variantSearchRef}
+                                className="input"
+                                type="text"
+                                placeholder="Search variants…"
+                                value={variantSearch}
+                                onChange={(e) => setVariantSearch(e.target.value)}
+                                style={{ paddingLeft: 32 }}
+                              />
+                            </div>
+                          </div>
+
+                          {/* Scrollable options. */}
+                          <div className="pk-vmenu-list">
+                            {filteredVariantOptions.length === 0 ? (
+                              <div
+                                style={{
+                                  padding: "18px 12px",
+                                  fontSize: "13px",
+                                  color:
+                                    "color-mix(in srgb, var(--color-text) 60%, transparent)",
+                                }}
+                              >
+                                No variants match “{variantSearch.trim()}”.
+                              </div>
+                            ) : (
+                              filteredVariantOptions.map((vt) => (
+                                <label
+                                  key={vt}
+                                  role="option"
+                                  aria-selected={selectedVariants.includes(vt)}
+                                  className="pk-vmenu-opt"
+                                >
+                                  <input
+                                    type="checkbox"
+                                    className="pk-chk"
+                                    checked={selectedVariants.includes(vt)}
+                                    onChange={() => toggleVariant(vt)}
+                                    style={{ marginTop: "2px" }}
+                                  />
+                                  {/* Full variant name — wrap rather than clip. */}
+                                  <span
+                                    style={{
+                                      whiteSpace: "normal",
+                                      overflowWrap: "anywhere",
+                                      lineHeight: 1.35,
+                                    }}
+                                  >
+                                    {vt}
+                                  </span>
+                                </label>
+                              ))
+                            )}
+                          </div>
+
+                          {/* Sticky footer: clear + done. */}
+                          <div className="pk-vmenu-foot">
+                            <button
+                              type="button"
+                              onClick={() => setSelectedVariants([])}
+                              disabled={selectedVariants.length === 0}
+                              style={{
+                                background: "transparent",
+                                border: "none",
+                                padding: "6px 4px",
+                                color: selectedVariants.length
+                                  ? "var(--color-accent)"
+                                  : "color-mix(in srgb, var(--color-text) 38%, transparent)",
+                                fontFamily: "var(--font-heading)",
+                                fontWeight: 800,
+                                fontSize: "12px",
+                                cursor: selectedVariants.length
+                                  ? "pointer"
+                                  : "default",
+                              }}
+                            >
+                              Clear
+                              {selectedVariants.length
+                                ? ` (${selectedVariants.length})`
+                                : ""}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-primary"
+                              onClick={() => setVariantMenuOpen(false)}
+                              style={{
+                                minHeight: 0,
+                                padding: "8px 18px",
+                                fontSize: "12px",
+                              }}
+                            >
+                              Done
+                            </button>
+                          </div>
+                        </div>
+                      </>
                     )}
                   </div>
 
