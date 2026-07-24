@@ -1016,7 +1016,7 @@ export default function Index() {
                             aria-selected={selectedVariants.includes(vt)}
                             style={{
                               display: "flex",
-                              alignItems: "center",
+                              alignItems: "flex-start",
                               gap: "9px",
                               padding: "8px 10px",
                               fontSize: "14px",
@@ -1029,14 +1029,11 @@ export default function Index() {
                               className="pk-chk"
                               checked={selectedVariants.includes(vt)}
                               onChange={() => toggleVariant(vt)}
+                              style={{ marginTop: "2px" }}
                             />
-                            <span
-                              style={{
-                                overflow: "hidden",
-                                textOverflow: "ellipsis",
-                                whiteSpace: "nowrap",
-                              }}
-                            >
+                            {/* Full variant name — wrap onto multiple lines
+                                rather than clip, so nothing is hidden. */}
+                            <span style={{ whiteSpace: "normal", overflowWrap: "anywhere", lineHeight: 1.35 }}>
                               {vt}
                             </span>
                           </label>
