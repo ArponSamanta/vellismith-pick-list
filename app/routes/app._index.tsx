@@ -155,6 +155,57 @@ function shopifyImg(
 const PRINT_IMG_WIDTH = 640;
 const PRINT_IMG_QUALITY = 90;
 
+// ─── Print stylesheet (shared) ───────────────────────────────────────────────
+// The rules that style the printable tables. Used in two places: gated behind
+// @media print on the embedded page, AND applied directly inside the standalone
+// print document we open in a new tab (see handlePrint). Keeping it in one const
+// means the on-page print preview and the new-tab document can never drift.
+const PRINT_LIST_CSS = `
+  #pick-list-print { display: block; font-family: var(--font-body); font-size: 9pt; color: #201e1d; }
+  .ph { margin-bottom: 6mm; padding-bottom: 3mm; border-bottom: 2px solid #201e1d; }
+  .ph-eyebrow { font-family: var(--font-heading); font-weight: 800; font-size: 7.5pt; letter-spacing: .12em; text-transform: uppercase; color: #ec3013; margin-bottom: 2mm; }
+  .ph-title { font-family: var(--font-heading); font-weight: 800; font-size: 22pt; letter-spacing: -.015em; line-height: 1; margin: 0; color: #201e1d; }
+  .ph-meta { font-size: 8pt; color: #605d5d; margin-top: 2.5mm; }
+  .pg-wrap, .pt-wrap { display: none; }
+  #pick-list-print[data-print-mode="manufacturing"] .pg-wrap { display: block; }
+  #pick-list-print[data-print-mode="tracking"] .pt-wrap { display: block; }
+  table.pm { width:100%; border-collapse:collapse; table-layout:fixed; }
+  .pm tr { page-break-inside:avoid; break-inside:avoid; }
+  .pm td { width:25%; vertical-align:top; padding:2.5mm; border:1px solid #c9c7c6; }
+  .pm td:empty { border:none; }
+  .pc { border:none; overflow:hidden; }
+  .pc img { width:100%; height:auto; display:block; }
+  .pc-noimg { width:100%; height:22mm; background:#eae9e9; display:flex; align-items:center; justify-content:center; font-size:6pt; letter-spacing:.06em; text-transform:uppercase; color:#9b9797; }
+  .pc-body { padding:2mm 0 0; }
+  .pc-title { font-family:var(--font-heading); font-weight:800; font-size:8pt; line-height:1.2; margin-bottom:1.5mm; color:#201e1d; }
+  .pc-vars { font-size:6.5pt; color:#7d7979; line-height:1.45; margin-bottom:2mm; }
+  .pc-var-row { margin-bottom:.5mm; }
+  .pc-vars b { color:#201e1d; }
+  .pc-qty { display:flex; align-items:baseline; justify-content:space-between; gap:2mm; border-top:1.5px solid #201e1d; padding-top:1.5mm; font-family:var(--font-heading); font-weight:800; font-size:13pt; color:#ec3013; }
+  .pc-qty::before { content:"To pick"; font-size:5.5pt; letter-spacing:.1em; text-transform:uppercase; color:#7d7979; }
+  table.pt { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  .pt thead { display: table-header-group; }
+  .pt th { text-align:left; font-family:var(--font-body); font-size:7pt; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:#605d5d; padding:2mm 3mm; border:1px solid #c9c7c6; border-bottom:2px solid #201e1d; }
+  .pt td { border:1px solid #c9c7c6; padding:2.5mm 3mm; vertical-align:middle; text-align:left; }
+  .pt tbody tr { page-break-inside: avoid; break-inside: avoid; }
+  .pt-col-img { width: 40mm; }
+  .pt-col-qty { width: 24mm; text-align: center; }
+  .pt-col-img img { width: 100%; height: auto; display: block; border:1px solid #c9c7c6; }
+  .pt-noimg { width: 100%; height: 28mm; background: #eae9e9; display: flex; align-items: center; justify-content: center; font-size: 6pt; letter-spacing:.06em; text-transform:uppercase; color: #9b9797; }
+  .pt-title { font-family:var(--font-heading); font-weight:800; font-size: 10pt; line-height: 1.25; margin-bottom: 1mm; color:#201e1d; }
+  .pt-vars { font-size: 7.5pt; color: #7d7979; line-height: 1.55; }
+  .pt-var-row { margin-bottom: 0.5mm; }
+  .pt-vars b { color:#201e1d; }
+  .pt-qty { font-family:var(--font-heading); font-weight:800; text-align: center; font-size: 14pt; color:#ec3013; }
+`;
+
+// Minimal tokens + webfont for the standalone print document (it doesn't share
+// the app's stylesheet).
+const PRINT_DOC_TOKENS = `
+  @import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&display=swap');
+  :root { --font-heading: "Archivo", system-ui, sans-serif; --font-body: "Archivo", system-ui, sans-serif; }
+`;
+
 // ─── Icons (lucide, inlined so there's no runtime dependency) ────────────────
 
 type IconProps = { size?: number; sw?: number; stroke?: string };
@@ -421,10 +472,51 @@ export default function Index() {
 
   const handlePrint = (mode: "tracking" | "manufacturing") => {
     if (!pickList.length) return;
-    // flushSync commits the data-print-mode attribute before window.print()
-    // fires, so the sheet reflects whichever button was just clicked.
+    // Commit the chosen layout before we read the print section's markup.
     flushSync(() => setPrintMode(mode));
-    window.print();
+    const src = document.getElementById("pick-list-print");
+    if (!src) {
+      window.print();
+      return;
+    }
+
+    // Open the list as its own standalone document in a new tab. This is far
+    // more reliable than window.print() from inside Shopify's embedded frame:
+    // mobile app WebViews routinely ignore an in-frame print (nothing happens),
+    // and even mobile browsers can print the wrong frame. A real top-level page
+    // gives the user native Print / Save-as-PDF / share on every platform.
+    const win = window.open("", "_blank");
+    if (!win) {
+      // Popups blocked or a single-window WebView — best-effort in-frame print.
+      window.print();
+      return;
+    }
+    const title = mode === "manufacturing" ? "Manufacturing list" : "Tracking list";
+    win.document.open();
+    win.document.write(
+      '<!doctype html><html><head><meta charset="utf-8">' +
+        '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+        "<title>Pick List — " + title + "</title><style>" +
+        PRINT_DOC_TOKENS +
+        "html,body{margin:0;background:#fff;color:#201e1d;font-family:var(--font-body);}" +
+        PRINT_LIST_CSS +
+        "#pick-list-print{padding:18px;}" +
+        ".pk-bar{position:sticky;top:0;z-index:9;display:flex;gap:8px;padding:12px 16px;" +
+        "background:#f3f2f2;border-bottom:2px solid #201e1d;}" +
+        ".pk-bar button{font-family:var(--font-heading);font-weight:800;font-size:14px;" +
+        "padding:11px 18px;border:1px solid #201e1d;background:#ec3013;color:#fff;cursor:pointer;}" +
+        "@media print{.pk-bar{display:none;}#pick-list-print{padding:0;}}" +
+        "@page{size:A4 portrait;margin:10mm;}" +
+        "</style></head><body>" +
+        '<div class="pk-bar"><button onclick="window.print()">Print / Save as PDF</button></div>' +
+        src.outerHTML +
+        // Auto-open the print dialog once images have loaded; the button is the
+        // fallback if a browser blocks the automatic call.
+        "<scr" + "ipt>window.addEventListener('load',function(){" +
+        "setTimeout(function(){try{window.focus();window.print();}catch(e){}},500);});</scr" + "ipt>" +
+        "</body></html>"
+    );
+    win.document.close();
   };
 
   useEffect(() => {
@@ -574,83 +666,45 @@ export default function Index() {
 
         @media screen { #pick-list-print { display: none !important; } }
 
+        /* ── Mobile ─────────────────────────────────────────────────── */
         @media (max-width: 640px) {
-          .pk-page { padding: 20px 16px 44px !important; }
-          .pk-header { flex-direction: column; align-items: stretch !important; gap: 16px !important; }
-          .pk-gen { width: 100% !important; }
-          .pk-filter-grid { flex-direction: column !important; }
+          .pk-page { padding: 22px 16px 44px !important; }
+          .pk-header { flex-direction: column; align-items: stretch !important; gap: 14px !important; }
+          .pk-header h1 { font-size: 32px !important; }
+          .pk-gen { width: 100% !important; justify-content: center; }
+          /* Stats: keep three across but shrink the big numerals + padding. */
+          .pk-stats > div { padding: 14px 12px !important; }
+          .pk-stats > div > div:first-child { font-size: 26px !important; }
+          .pk-filter-grid { flex-direction: column !important; gap: 12px !important; }
           .pk-filter-grid > * { flex: 1 1 100% !important; min-width: 0 !important; }
-          .pk-toggles { flex-direction: column !important; align-items: stretch !important; gap: 14px !important; }
+          .pk-toggles { flex-direction: column !important; align-items: stretch !important; gap: 16px !important; }
+          /* Stack the display toggles into a tappable vertical list. */
+          .pk-toggles > div { flex-direction: column !important; align-items: flex-start !important; gap: 14px !important; }
+          .pk-toggles .btn { width: 100%; justify-content: center; }
+          .pk-resbar { flex-direction: column; align-items: stretch !important; gap: 12px; }
           .pk-print-btns { width: 100%; flex-direction: column; }
           .pk-print-btns .btn { width: 100%; }
-          .pk-resbar { flex-direction: column; align-items: stretch !important; gap: 14px; }
+          /* Two products per row on phones. */
+          .pk-grid { grid-template-columns: repeat(2, 1fr) !important; gap: 12px !important; }
+          .pk-panel { padding: 24px 18px !important; gap: 16px !important; }
+          .pk-panel svg { width: 30px !important; height: 30px !important; }
+          /* Comfortable touch targets. */
+          .pk-app .input, .pk-app .btn { min-height: 44px; }
           .pk-chk { width: 20px !important; height: 20px !important; }
         }
+        @media (max-width: 400px) {
+          .pk-grid { grid-template-columns: 1fr !important; }
+          .pk-header h1 { font-size: 28px !important; }
+          .pk-stats > div > div:first-child { font-size: 23px !important; }
+        }
 
-        /* ── Print: hide the on-screen app, reveal the dedicated table
-           layout. These are real <table> elements (not CSS grid) so the
-           printed sheet pastes into Google Docs / Word as an actual editable
-           table, and each <tr> repaginates whole. ────────────────────────── */
+        /* ── Print: hide the on-screen app, reveal the dedicated table layout.
+           Real <table> elements (not CSS grid) so the sheet pastes into Google
+           Docs / Word as an editable table. Styling lives in PRINT_LIST_CSS,
+           shared with the standalone print document (see handlePrint). ─────── */
         @media print {
           .pk-app { display: none !important; }
-          #pick-list-print {
-            display: block !important;
-            font-family: var(--font-body);
-            font-size: 9pt;
-            color: #201e1d;
-          }
-
-          /* Masthead — mirrors the on-screen header: vermilion eyebrow,
-             heavy Archivo title, muted meta line, thick ink rule. */
-          .ph { margin-bottom: 6mm; padding-bottom: 3mm; border-bottom: 2px solid #201e1d; }
-          .ph-eyebrow { font-family: var(--font-heading); font-weight: 800; font-size: 7.5pt; letter-spacing: .12em; text-transform: uppercase; color: #ec3013; margin-bottom: 2mm; }
-          .ph-title { font-family: var(--font-heading); font-weight: 800; font-size: 22pt; letter-spacing: -.015em; line-height: 1; margin: 0; color: #201e1d; }
-          .ph-meta { font-size: 8pt; color: #605d5d; margin-top: 2.5mm; }
-
-          /* Only the wrapper matching the active print mode is shown */
-          .pg-wrap, .pt-wrap { display: none !important; }
-          #pick-list-print[data-print-mode="manufacturing"] .pg-wrap { display: block !important; }
-          #pick-list-print[data-print-mode="tracking"] .pt-wrap      { display: block !important; }
-
-          /* ── Manufacturing list: 4 products per row on A4 portrait ── */
-          table.pm { width:100%; border-collapse:collapse; table-layout:fixed; }
-          .pm tr   { page-break-inside:avoid; break-inside:avoid; }
-          .pm td   { width:25%; vertical-align:top; padding:2.5mm; border:1px solid #c9c7c6; }
-          /* A short final row still renders 4 <td>; the empty ones have no
-             children — hide their border so they read as blank space. */
-          .pm td:empty { border:none; }
-          .pc      { border:none; overflow:hidden; }
-          .pc img  { width:100%; height:auto; display:block; }
-          .pc-noimg { width:100%; height:22mm; background:#eae9e9; display:flex; align-items:center; justify-content:center; font-size:6pt; letter-spacing:.06em; text-transform:uppercase; color:#9b9797; }
-          .pc-body { padding:2mm 0 0; }
-          .pc-title { font-family:var(--font-heading); font-weight:800; font-size:8pt; line-height:1.2; margin-bottom:1.5mm; color:#201e1d; }
-          .pc-vars { font-size:6.5pt; color:#7d7979; line-height:1.45; margin-bottom:2mm; }
-          .pc-var-row { margin-bottom:.5mm; }
-          .pc-vars b { color:#201e1d; }
-          /* Card foot echoes the screen card: "TO PICK" label + vermilion total,
-             separated by an ink rule. */
-          .pc-qty  { display:flex; align-items:baseline; justify-content:space-between; gap:2mm; border-top:1.5px solid #201e1d; padding-top:1.5mm; font-family:var(--font-heading); font-weight:800; font-size:13pt; color:#ec3013; }
-          .pc-qty::before { content:"To pick"; font-size:5.5pt; letter-spacing:.1em; text-transform:uppercase; color:#7d7979; }
-
-          /* ── Tracking list: one row per product ───────────────────── */
-          table.pt { width: 100%; border-collapse: collapse; table-layout: fixed; }
-          /* Repeats the header row on every printed page */
-          .pt thead { display: table-header-group; }
-          /* Full grid: vertical separators divide the three columns
-             (Image | Product & variants | Qty), horizontal ones divide rows.
-             Header keeps the strong 2px ink underline. */
-          .pt th { text-align:left; font-family:var(--font-body); font-size:7pt; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:#605d5d; padding:2mm 3mm; border:1px solid #c9c7c6; border-bottom:2px solid #201e1d; }
-          .pt td { border:1px solid #c9c7c6; padding:2.5mm 3mm; vertical-align:middle; text-align:left; }
-          .pt tbody tr { page-break-inside: avoid; break-inside: avoid; }
-          .pt-col-img { width: 40mm; }
-          .pt-col-qty { width: 24mm; text-align: center; }
-          .pt-col-img img { width: 100%; height: auto; display: block; border:1px solid #c9c7c6; }
-          .pt-noimg { width: 100%; height: 28mm; background: #eae9e9; display: flex; align-items: center; justify-content: center; font-size: 6pt; letter-spacing:.06em; text-transform:uppercase; color: #9b9797; }
-          .pt-title { font-family:var(--font-heading); font-weight:800; font-size: 10pt; line-height: 1.25; margin-bottom: 1mm; color:#201e1d; }
-          .pt-vars  { font-size: 7.5pt; color: #7d7979; line-height: 1.55; }
-          .pt-var-row { margin-bottom: 0.5mm; }
-          .pt-vars b { color:#201e1d; }
-          .pt-qty { font-family:var(--font-heading); font-weight:800; text-align: center; font-size: 14pt; color:#ec3013; }
+          ${PRINT_LIST_CSS}
         }
         @page { size: A4 portrait; margin: 10mm; }
       `}</style>
@@ -1137,7 +1191,7 @@ export default function Index() {
           <div className="pk-results" data-print-mode={printMode}>
             {showIntro && (
               <div
-                className="pk-noprint"
+                className="pk-panel pk-noprint"
                 style={{
                   animation: "pkFade .4s ease",
                   border: "2px solid var(--color-divider)",
@@ -1336,7 +1390,7 @@ export default function Index() {
 
             {showEmpty && (
               <div
-                className="pk-noprint"
+                className="pk-panel pk-noprint"
                 style={{
                   animation: "pkFade .4s ease",
                   border: "2px solid var(--color-divider)",
