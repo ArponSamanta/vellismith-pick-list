@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import type {
   ActionFunctionArgs,
@@ -149,16 +149,95 @@ function shopifyImg(
   }
 }
 
-// Widths/quality requested from Shopify's CDN for each context.
-// PRINT_IMG_WIDTH is generous (vs. a typical thumbnail) on purpose: this is
-// a manufacturing pick list, so stone colour, filigree, clasp style etc.
-// need to stay legible on the printed sheet. It's still a small fraction of
-// a typical original (1500–3000px+), so the PDF stays well under control.
-// Raise PRINT_IMG_WIDTH/PRINT_IMG_QUALITY further if detail still isn't
-// clear enough on your printer; lower them if the PDF grows too large again.
+// Widths/quality requested from Shopify's CDN. A single <img> per card now
+// serves both screen and print (the print stylesheet just reshapes the cards),
+// so we request the print-grade size — sharp on paper, still modest on screen.
 const PRINT_IMG_WIDTH = 640;
 const PRINT_IMG_QUALITY = 90;
-const SCREEN_IMG_WIDTH = 440; // on-screen cards are ~220px wide; 2x for retina
+
+// ─── Icons (lucide, inlined so there's no runtime dependency) ────────────────
+
+type IconProps = { size?: number; sw?: number; stroke?: string };
+const iconAttrs = (size: number, sw: number, stroke: string) => ({
+  width: size,
+  height: size,
+  viewBox: "0 0 24 24",
+  fill: "none",
+  stroke,
+  strokeWidth: sw,
+  strokeLinecap: "round" as const,
+  strokeLinejoin: "round" as const,
+});
+const IconBox = ({ size = 18, sw = 2, stroke = "currentColor" }: IconProps) => (
+  <svg {...iconAttrs(size, sw, stroke)}>
+    <path d="m7.5 4.27 9 5.15" />
+    <path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" />
+    <path d="m3.3 7 8.7 5 8.7-5" />
+    <path d="M12 22V12" />
+  </svg>
+);
+const IconFilter = ({ size = 16, sw = 2, stroke = "currentColor" }: IconProps) => (
+  <svg {...iconAttrs(size, sw, stroke)}>
+    <line x1="21" x2="14" y1="4" y2="4" />
+    <line x1="10" x2="3" y1="4" y2="4" />
+    <line x1="21" x2="12" y1="12" y2="12" />
+    <line x1="8" x2="3" y1="12" y2="12" />
+    <line x1="21" x2="16" y1="20" y2="20" />
+    <line x1="12" x2="3" y1="20" y2="20" />
+    <line x1="14" x2="14" y1="2" y2="6" />
+    <line x1="8" x2="8" y1="10" y2="14" />
+    <line x1="16" x2="16" y1="18" y2="22" />
+  </svg>
+);
+const IconChevron = ({ up = false, size = 15, stroke = "currentColor" }: IconProps & { up?: boolean }) => (
+  <svg {...iconAttrs(size, 2, stroke)}>
+    <path d={up ? "m18 15-6-6-6 6" : "m6 9 6 6 6-6"} />
+  </svg>
+);
+const IconX = ({ size = 15, sw = 2, stroke = "currentColor" }: IconProps) => (
+  <svg {...iconAttrs(size, sw, stroke)}>
+    <path d="M18 6 6 18" />
+    <path d="m6 6 12 12" />
+  </svg>
+);
+const IconPrinter = ({ size = 16, stroke = "currentColor" }: IconProps) => (
+  <svg {...iconAttrs(size, 2, stroke)}>
+    <path d="M12 16h.01" />
+    <path d="M16 16h.01" />
+    <path d="M3 19a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9.5a.5.5 0 0 0-.769-.422l-4.462 2.844A.5.5 0 0 1 15 11.5v-2a.5.5 0 0 0-.769-.422L9.77 11.922A.5.5 0 0 1 9 11.5V5a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1z" />
+    <path d="M8 16h.01" />
+  </svg>
+);
+const IconClipboard = ({ size = 16, stroke = "currentColor" }: IconProps) => (
+  <svg {...iconAttrs(size, 2, stroke)}>
+    <rect width="8" height="4" x="8" y="2" rx="1" ry="1" />
+    <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+    <path d="M12 11h4" />
+    <path d="M12 16h4" />
+    <path d="M8 11h.01" />
+    <path d="M8 16h.01" />
+  </svg>
+);
+const IconWarn = ({ size = 18, stroke = "currentColor" }: IconProps) => (
+  <svg {...iconAttrs(size, 2, stroke)}>
+    <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" />
+    <path d="M12 9v4" />
+    <path d="M12 17h.01" />
+  </svg>
+);
+const IconError = ({ size = 18, stroke = "currentColor" }: IconProps) => (
+  <svg {...iconAttrs(size, 2, stroke)}>
+    <circle cx="12" cy="12" r="10" />
+    <path d="m15 9-6 6" />
+    <path d="m9 9 6 6" />
+  </svg>
+);
+const IconInbox = ({ size = 38, sw = 1.6, stroke = "currentColor" }: IconProps) => (
+  <svg {...iconAttrs(size, sw, stroke)}>
+    <path d="M22 12h-6l-2 3h-4l-2-3H2" />
+    <path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
+  </svg>
+);
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
@@ -173,14 +252,14 @@ export default function Index() {
   const [showSku, setShowSku] = useState(true);
   const [showVariantQuantity, setShowVariantQuantity] = useState(true);
   const [showOrderId, setShowOrderId] = useState(false);
-  const [showFilters, setShowFilters] = useState(false);
-  // Client-side drill-down: an exact variant title chosen from the dropdown.
-  // "" means "all variants" (no collapse). This never hits the server — it just
-  // reshapes the already-fetched list, so switching variants is instant.
-  const [selectedVariant, setSelectedVariant] = useState("");
-  // Which hidden print container @media print should reveal. Defaults to
-  // "manufacturing" so a stray Ctrl/Cmd+P (bypassing our buttons) falls back
-  // to the original dense grid rather than the newer table.
+  const [showFilters, setShowFilters] = useState(true);
+  // Client-side drill-down: the variant titles chosen from the dropdown.
+  // Empty means "all variants" (no collapse). This never hits the server — it
+  // just reshapes the already-fetched list, so switching variants is instant.
+  const [selectedVariants, setSelectedVariants] = useState<string[]>([]);
+  const [variantMenuOpen, setVariantMenuOpen] = useState(false);
+  const variantMenuRef = useRef<HTMLDivElement>(null);
+  // Which layout @media print should reveal (set on data-print-mode).
   const [printMode, setPrintMode] = useState<"tracking" | "manufacturing">(
     "manufacturing"
   );
@@ -210,43 +289,114 @@ export default function Index() {
     );
   }, [rawPickList]);
 
-  // The list actually rendered/printed. When a variant is selected, collapse
-  // each product to just that variant and recalculate its total to match — a
-  // true "that variant only" pick list. Otherwise it's the full list.
+  // The list actually rendered/printed. Collapse each product to the selected
+  // variants (their union) and recalculate its total, then sort client-side so
+  // both the variant filter and the sort control take effect instantly.
   const pickList: any[] = useMemo(() => {
-    if (!selectedVariant) return rawPickList;
-    return rawPickList
-      .map((p) => {
-        const variants = p.variants.filter(
-          (v: any) => v.variantTitle === selectedVariant
-        );
-        if (variants.length === 0) return null;
-        const totalQuantity = variants.reduce(
-          (s: number, v: any) => s + v.quantity,
-          0
-        );
-        return { ...p, variants, totalQuantity };
-      })
-      .filter(Boolean);
-  }, [rawPickList, selectedVariant]);
+    const chosen = new Set(selectedVariants);
+    let list =
+      selectedVariants.length === 0
+        ? rawPickList.slice()
+        : rawPickList
+            .map((p) => {
+              const variants = p.variants.filter((v: any) =>
+                chosen.has(v.variantTitle)
+              );
+              if (variants.length === 0) return null;
+              const totalQuantity = variants.reduce(
+                (s: number, v: any) => s + v.quantity,
+                0
+              );
+              return { ...p, variants, totalQuantity };
+            })
+            .filter(Boolean);
 
-  // If the selected variant is no longer present (new list generated, keyword
-  // changed), drop back to "all variants" so we never show an empty result for
-  // a stale selection.
+    const t = (d: string) => new Date(d).getTime();
+    list.sort((a: any, b: any) => {
+      switch (sortBy) {
+        case "old-to-new":
+          return t(a.earliestCreatedAt) - t(b.earliestCreatedAt);
+        case "new-to-old":
+          return t(b.latestCreatedAt) - t(a.latestCreatedAt);
+        case "qty-high-to-low":
+          return b.totalQuantity - a.totalQuantity;
+        case "qty-low-to-high":
+          return a.totalQuantity - b.totalQuantity;
+        default:
+          return a.productTitle
+            .toLowerCase()
+            .localeCompare(b.productTitle.toLowerCase());
+      }
+    });
+    return list;
+  }, [rawPickList, selectedVariants, sortBy]);
+
+  // Drop any selected variants that are no longer present (new list generated,
+  // keyword changed) so we never show an empty result for a stale selection.
   useEffect(() => {
-    if (selectedVariant && !variantOptions.includes(selectedVariant)) {
-      setSelectedVariant("");
+    const stillPresent = selectedVariants.filter((v) =>
+      variantOptions.includes(v)
+    );
+    if (stillPresent.length !== selectedVariants.length) {
+      setSelectedVariants(stillPresent);
     }
-  }, [variantOptions, selectedVariant]);
+  }, [variantOptions, selectedVariants]);
+
+  // Close the variant menu on an outside click.
+  useEffect(() => {
+    if (!variantMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (
+        variantMenuRef.current &&
+        !variantMenuRef.current.contains(e.target as Node)
+      ) {
+        setVariantMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [variantMenuOpen]);
+
+  const toggleVariant = (vt: string) => {
+    setSelectedVariants((prev) =>
+      prev.includes(vt) ? prev.filter((x) => x !== vt) : [...prev, vt]
+    );
+  };
 
   const totalProducts = pickList.length;
   const totalItems = pickList.reduce(
     (sum: number, p: any) => sum + p.totalQuantity,
     0
   );
+  // Distinct orders represented by the currently displayed variants.
+  const unfulfilledOrders = useMemo(() => {
+    const set = new Set<string>();
+    for (const p of pickList)
+      for (const v of p.variants)
+        for (const o of v.orderNumbers ?? []) set.add(o);
+    return set.size;
+  }, [pickList]);
 
-  const submitPickList = (e: React.FormEvent) => {
-    e.preventDefault();
+  const today = new Date().toLocaleDateString("en-GB", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+  const variantLabel =
+    selectedVariants.length === 0
+      ? "All variants"
+      : selectedVariants.length === 1
+        ? selectedVariants[0]
+        : `${selectedVariants.length} variants selected`;
+
+  const generated = fetcher.data?.success === true;
+  const errored = fetcher.data?.success === false;
+  const showIntro = !fetcher.data && !isLoading;
+  const showResults = generated && !isLoading && pickList.length > 0;
+  const showEmpty = generated && !isLoading && pickList.length === 0;
+  const variantHasOptions = variantOptions.length > 0;
+
+  const runGenerate = () => {
     const fd = new FormData();
     if (startDate) fd.append("startDate", startDate);
     if (endDate) fd.append("endDate", endDate);
@@ -265,18 +415,15 @@ export default function Index() {
     setShowSku(true);
     setShowVariantQuantity(true);
     setShowOrderId(false);
-    setSelectedVariant("");
+    setSelectedVariants([]);
+    setVariantMenuOpen(false);
   };
 
   const handlePrint = (mode: "tracking" | "manufacturing") => {
     if (!pickList.length) return;
-    // setPrintMode alone is async — without flushSync, window.print() could
-    // fire before React commits the new data-print-mode attribute, printing
-    // whichever list was showing a moment ago instead of the one just
-    // clicked. flushSync forces that commit first.
-    flushSync(() => {
-      setPrintMode(mode);
-    });
+    // flushSync commits the data-print-mode attribute before window.print()
+    // fires, so the sheet reflects whichever button was just clicked.
+    flushSync(() => setPrintMode(mode));
     window.print();
   };
 
@@ -288,369 +435,243 @@ export default function Index() {
     }
   }, [fetcher.data?.success, shopify]);
 
-  // ── Shared styles ─────────────────────────────────────────────────────────
-
-  const filterContent: React.CSSProperties = {
+  // ── Reused inline styles ────────────────────────────────────────────────
+  const eyebrow: React.CSSProperties = {
+    fontSize: "11px",
+    letterSpacing: ".12em",
+    textTransform: "uppercase",
+    color: "var(--color-accent)",
+    marginBottom: "10px",
+  };
+  const statCell = (last = false): React.CSSProperties => ({
+    flex: 1,
+    padding: "20px 22px",
+    borderRight: last ? "none" : "1px solid var(--color-divider)",
+  });
+  const statNum: React.CSSProperties = {
+    fontFamily: "var(--font-heading)",
+    fontWeight: 800,
+    fontSize: "40px",
+    lineHeight: 1,
+  };
+  const statLabel: React.CSSProperties = {
+    fontSize: "11px",
+    letterSpacing: ".1em",
+    textTransform: "uppercase",
+    color: "var(--color-neutral-600)",
+    marginTop: "6px",
+  };
+  const dividerRow: React.CSSProperties = {
+    borderBottom: "2px solid var(--color-divider)",
+  };
+  const noticeBox: React.CSSProperties = {
+    animation: "pkFade .3s ease",
+    border: "1px solid var(--color-divider)",
+    borderLeft: "3px solid var(--color-accent)",
+    background: "var(--color-accent-100)",
+    padding: "16px 18px",
+    marginTop: "18px",
     display: "flex",
     gap: "12px",
-    padding: "20px",
-    backgroundColor: "var(--s-color-bg-subdued)",
-    borderRadius: "12px",
-    flexWrap: "wrap",
-    alignItems: "flex-end",
-    border: "1px solid var(--s-color-border-subdued)",
+    alignItems: "flex-start",
   };
 
-  /** Each filter field: grows/shrinks but never goes below min-width */
-  const fieldWrapper = (minW = 140): React.CSSProperties => ({
-    flex: `1 1 ${minW}px`,
-    minWidth: `${minW}px`,
-  });
-
-  const labelStyle: React.CSSProperties = {
-    display: "block",
-    marginBottom: "6px",
-    fontSize: "13px",
-    fontWeight: "600",
+  const variantLine = (v: any) => {
+    let s = v.variantTitle;
+    if (showSku && v.sku) s += ` (${v.sku})`;
+    if (showOrderId && v.orderNumbers?.length) s += ` [${v.orderNumbers.join(", ")}]`;
+    return s;
   };
-
-  const selectStyle: React.CSSProperties = {
-    padding: "8px 12px",
-    border: "1px solid var(--s-color-border)",
-    borderRadius: "6px",
-    fontSize: "14px",
-    fontFamily: "inherit",
-    backgroundColor: "var(--s-color-bg)",
-    color: "var(--s-color-text)",
-    cursor: "pointer",
-    width: "100%",
-    boxSizing: "border-box",
-    transition: "border-color 200ms, box-shadow 200ms",
-  };
-
-  const checkboxLabel: React.CSSProperties = {
-    display: "flex",
-    alignItems: "center",
-    gap: "8px",
-    fontSize: "14px",
-    fontWeight: "500",
-    cursor: "pointer",
-    userSelect: "none",
-    color: "var(--s-color-text)",
-  };
-
-  const statsContainer: React.CSSProperties = {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
-    gap: "16px",
-    maxWidth: "400px",
-    margin: "32px auto 0",
-  };
-
-  const statCard: React.CSSProperties = {
-    padding: "20px",
-    backgroundColor: "var(--s-color-bg-subdued)",
-    borderRadius: "12px",
-    textAlign: "center",
-    border: "1px solid var(--s-color-border-subdued)",
-    transition: "all 200ms ease-in-out",
-  };
+  const showVarLines = showVariantQuantity || showSku || showOrderId;
 
   return (
     <>
-      {/* ──────────────────────────────────────────────────────────────────── */}
-      {/* Global styles                                                        */}
-      {/* ──────────────────────────────────────────────────────────────────── */}
       <style>{`
-        @keyframes fadeIn {
-          from { opacity: 0; transform: translateY(10px); }
-          to   { opacity: 1; transform: translateY(0); }
+        @import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&display=swap');
+
+        :root {
+          --color-bg: #f3f2f2;
+          --color-surface: #eae9e9;
+          --color-text: #201e1d;
+          --color-accent: #ec3013;
+          --color-divider: color-mix(in srgb, #201e1d 40%, transparent);
+          --color-neutral-200: #eae7e7;
+          --color-neutral-500: #9b9797;
+          --color-neutral-600: #7d7979;
+          --color-accent-100: #fff2ef;
+          --color-accent-700: #ae1800;
+          --color-accent-800: #7c1405;
+          --font-heading: "Archivo", system-ui, sans-serif;
+          --font-body: "Archivo", system-ui, sans-serif;
+          --shadow-md: 0 3px 10px color-mix(in srgb, #2d2b2b 16%, transparent);
+          --shadow-lg: 0 12px 32px color-mix(in srgb, #2d2b2b 22%, transparent);
         }
 
-        /* ── Common form controls ─────────────────────────────────── */
-        button { font-family: inherit; border: none; border-radius: 6px; cursor: pointer; }
-        s-button:not([disabled]):hover { filter: brightness(1.05); }
-
-        input[type="date"], select {
-          box-sizing: border-box;
-          width: 100%;
-          padding: 8px 12px;
-          border: 1px solid var(--s-color-border);
-          border-radius: 6px;
-          font-size: 14px;
-          font-family: inherit;
-          background-color: var(--s-color-bg);
-          color: var(--s-color-text);
-          transition: border-color 200ms, box-shadow 200ms;
+        .pk-app *, .pk-app *::before, .pk-app *::after { box-sizing: border-box; }
+        .pk-app {
+          background: var(--color-bg);
+          color: var(--color-text);
+          font-family: var(--font-body);
+          font-size: 15px;
+          line-height: 1.55;
+          min-height: 100vh;
         }
-        input[type="date"]:hover, select:hover  { border-color: var(--s-color-interactive-hover); }
-        input[type="date"]:focus, select:focus   {
-          outline: none;
-          border-color: var(--s-color-interactive);
-          box-shadow: 0 0 0 3px rgba(0,0,0,0.1);
+        .pk-app h1, .pk-app h2, .pk-app h3, .pk-app h4 {
+          font-family: var(--font-heading); font-weight: 800;
+          line-height: 1.12; letter-spacing: -0.015em; margin: 0 0 8px;
         }
-        input[type="checkbox"] {
-          width: 16px; height: 16px;
-          cursor: pointer;
-          accent-color: var(--s-color-interactive);
-          flex-shrink: 0;
+        .pk-app h1 { font-size: 42px; }
+        .pk-app h2 { font-size: 32px; }
+        .pk-app h3 { font-size: 25px; }
+        .pk-app .text-muted { color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+        .pk-app a { color: var(--color-accent); text-decoration: none; }
+
+        /* buttons */
+        .pk-app .btn {
+          display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+          cursor: pointer; text-decoration: none;
+          font-family: var(--font-heading); font-weight: 800; font-size: 14px; line-height: 1.2;
+          color: var(--color-text); background: transparent;
+          border: 1px solid transparent; padding: 8px 14px; border-radius: 0;
         }
+        .pk-app .btn svg { display: block; }
+        .pk-app .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+        .pk-app .btn-primary { background: var(--color-accent); color: var(--color-bg); }
+        .pk-app .btn-primary:not(:disabled):hover { background: var(--color-accent-700); }
+        .pk-app .btn-secondary { border-color: var(--color-divider); }
+        .pk-app .btn-secondary:hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
 
-        /* ── Mobile responsiveness for Shopify Mobile App ─────────── */
-        /* Shopify Mobile WebView is typically 375-428px wide */
-        @media (max-width: 428px) {
-          /* Make filter inputs full width and larger for touch */
-          input[type="date"], select {
-            font-size: 16px !important;
-            padding: 12px !important;
-            min-height: 44px;
-          }
-          
-          /* Larger checkboxes for touch */
-          input[type="checkbox"] {
-            width: 22px !important;
-            height: 22px !important;
-          }
-          
-          /* Stack filter form vertically */
-          #filter-panel form {
-            flex-direction: column !important;
-            gap: 12px !important;
-            padding: 16px !important;
-          }
-          
-          /* Full-width filter fields */
-          #filter-panel form > div {
-            flex: 1 1 100% !important;
-            min-width: 100% !important;
-          }
-          
-          /* Stack action buttons full width */
-          .filter-actions {
-            flex-direction: column !important;
-            width: 100% !important;
-          }
-          
-          .filter-actions button,
-          .filter-actions s-button {
-            width: 100% !important;
-          }
-
-          /* Stack the two print-list buttons full width too */
-          .print-actions {
-            flex-direction: column !important;
-            width: 100% !important;
-          }
-
-          .print-actions button,
-          .print-actions s-button {
-            width: 100% !important;
-          }
+        /* forms */
+        .pk-app .field > label {
+          display: block; font-size: 12px; margin-bottom: 5px;
+          color: color-mix(in srgb, var(--color-text) 70%, transparent);
         }
+        .pk-app .input {
+          width: 100%; min-height: 36px; padding: 6px 10px; font: inherit;
+          font-size: 14px; color: var(--color-text); caret-color: var(--color-accent);
+          background: var(--color-surface);
+          border: 1px solid var(--color-divider); border-radius: 0;
+        }
+        .pk-app .input:hover { border-color: color-mix(in srgb, var(--color-text) 45%, transparent); }
+        .pk-app .input:focus-visible { border-color: var(--color-accent); outline: none; }
+        .pk-app input[type="checkbox"].pk-chk {
+          width: 16px; height: 16px; accent-color: var(--color-accent); cursor: pointer; flex: none;
+        }
+        .pk-app :focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
 
-        /* ── Screen: hide the print div ───────────────────────────── */
-        @media screen {
-          #pick-list-print { display: none !important; }
+        /* tags */
+        .pk-app .tag {
+          display: inline-flex; align-items: center; font-size: 11px;
+          letter-spacing: 0.02em; padding: 3px 10px; border-radius: 0;
+        }
+        .pk-app .tag-accent { background: var(--color-accent-100); color: var(--color-accent-800); }
+
+        .pk-card { transition: box-shadow 180ms ease; }
+        .pk-card:hover { box-shadow: var(--shadow-md); }
+
+        @keyframes pkFade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+        @keyframes pkPulse { 0%,100% { opacity: .45; } 50% { opacity: .85; } }
+
+        @media screen { #pick-list-print { display: none !important; } }
+
+        @media (max-width: 640px) {
+          .pk-page { padding: 20px 16px 44px !important; }
+          .pk-header { flex-direction: column; align-items: stretch !important; gap: 16px !important; }
+          .pk-gen { width: 100% !important; }
+          .pk-filter-grid { flex-direction: column !important; }
+          .pk-filter-grid > * { flex: 1 1 100% !important; min-width: 0 !important; }
+          .pk-toggles { flex-direction: column !important; align-items: stretch !important; gap: 14px !important; }
+          .pk-print-btns { width: 100%; flex-direction: column; }
+          .pk-print-btns .btn { width: 100%; }
+          .pk-resbar { flex-direction: column; align-items: stretch !important; gap: 14px; }
+          .pk-chk { width: 20px !important; height: 20px !important; }
         }
 
-        /* ── Print ────────────────────────────────────────────────── */
-        /*
-         * When window.print() fires:
-         *   s-page            → hidden (removes all Shopify Admin chrome)
-         *   #pick-list-print  → shown, but only ONE of its two children:
-         *     [data-print-mode="manufacturing"] → .pg-wrap (dense 4-up table)
-         *     [data-print-mode="tracking"]      → .pt-wrap (structured table)
-         *   handlePrint() sets data-print-mode right before calling
-         *   window.print(), so whichever button was clicked is what shows.
-         *
-         * Manufacturing list: 4 products per row, built with a real
-         * <table> (table.pm) rather than CSS grid — a <tr> either fits on
-         * the page whole or moves to the next one, so it repaginates as
-         * predictably as the tracking table below, and pastes into
-         * Word/Google Docs the same way straight from print preview.
-         * Tracking list: one row per product — browsers repeat its
-         * <thead> on every printed page automatically.
-         * Both pull the same resized (never cropped), high-quality image
-         * URL per product, so the browser fetches each photo once and
-         * reuses it from cache for whichever list isn't currently showing.
-         */
+        /* ── Print: hide the on-screen app, reveal the dedicated table
+           layout. These are real <table> elements (not CSS grid) so the
+           printed sheet pastes into Google Docs / Word as an actual editable
+           table, and each <tr> repaginates whole. ────────────────────────── */
         @media print {
-          s-page            { display: none !important; }
-          #pick-list-print  {
+          .pk-app { display: none !important; }
+          #pick-list-print {
             display: block !important;
-            font-family: Arial, sans-serif;
+            font-family: var(--font-body);
             font-size: 9pt;
-            color: #000;
+            color: #201e1d;
           }
 
-          .ph               { margin-bottom: 4mm; }
-          .ph-title         { font-size: 13pt; font-weight: bold; margin: 0 0 2mm; }
-          .ph-meta          { font-size: 7.5pt; color: #444; margin: 0; }
+          /* Masthead — mirrors the on-screen header: vermilion eyebrow,
+             heavy Archivo title, muted meta line, thick ink rule. */
+          .ph { margin-bottom: 6mm; padding-bottom: 3mm; border-bottom: 2px solid #201e1d; }
+          .ph-eyebrow { font-family: var(--font-heading); font-weight: 800; font-size: 7.5pt; letter-spacing: .12em; text-transform: uppercase; color: #ec3013; margin-bottom: 2mm; }
+          .ph-title { font-family: var(--font-heading); font-weight: 800; font-size: 22pt; letter-spacing: -.015em; line-height: 1; margin: 0; color: #201e1d; }
+          .ph-meta { font-size: 8pt; color: #605d5d; margin-top: 2.5mm; }
 
           /* Only the wrapper matching the active print mode is shown */
           .pg-wrap, .pt-wrap { display: none !important; }
           #pick-list-print[data-print-mode="manufacturing"] .pg-wrap { display: block !important; }
           #pick-list-print[data-print-mode="tracking"] .pt-wrap      { display: block !important; }
 
-          /* ── Manufacturing list: 4 cards per row on A4 portrait ──── */
-          table.pm{
-              width:100%;
-              border-collapse:collapse;
-              table-layout:fixed;
-          }
-
-          .pm tr{
-              page-break-inside:avoid;
-              break-inside:avoid;
-          }
-
-          .pm td{
-              width:25%;
-              vertical-align:top;
-              padding:2mm;
-              border:1px solid #ddd;
-          }
-          /* A short final row (pickList.length not a multiple of 4) still
-             renders 4 <td>, but the empty ones have no children — hide
-             their border/padding so they read as blank space, not boxes */
-          .pm td:empty{
-              border:none;
-          }
-
-          .pc{
-              border:none;
-              overflow:hidden;
-          }
-
-          .pc img{
-              width:100%;
-              height:auto;
-              display:block;
-          }
-
-          .pc-noimg{
-              width:100%;
-              height:22mm;
-              background:#f0f0f0;
-              display:flex;
-              align-items:center;
-              justify-content:center;
-              font-size:6.5pt;
-              color:#888;
-          }
-
-          .pc-body{
-              padding:2mm;
-          }
-
-          .pc-title{
-              font-size:7.5pt;
-              font-weight:bold;
-              line-height:1.25;
-              margin-bottom:1mm;
-          }
-
-          /* Wrapper for the variant list */
-          .pc-vars{
-              font-size:6.5pt;
-              color:#555;
-              line-height:1.4;
-              margin-bottom:1mm;
-          }
-
-          /* Each variant row */
-          .pc-var-row{
-              margin-bottom:.5mm;
-          }
-
-          .pc-qty{
-              margin-top:1mm;
-              background:#fffacd;
-              text-align:center;
-              font-size:11pt;
-              font-weight:bold;
-              padding:1mm;
-              border-radius:2px;
-          }
+          /* ── Manufacturing list: 4 products per row on A4 portrait ── */
+          table.pm { width:100%; border-collapse:collapse; table-layout:fixed; }
+          .pm tr   { page-break-inside:avoid; break-inside:avoid; }
+          .pm td   { width:25%; vertical-align:top; padding:2.5mm; border:1px solid #c9c7c6; }
+          /* A short final row still renders 4 <td>; the empty ones have no
+             children — hide their border so they read as blank space. */
+          .pm td:empty { border:none; }
+          .pc      { border:none; overflow:hidden; }
+          .pc img  { width:100%; height:auto; display:block; }
+          .pc-noimg { width:100%; height:22mm; background:#eae9e9; display:flex; align-items:center; justify-content:center; font-size:6pt; letter-spacing:.06em; text-transform:uppercase; color:#9b9797; }
+          .pc-body { padding:2mm 0 0; }
+          .pc-title { font-family:var(--font-heading); font-weight:800; font-size:8pt; line-height:1.2; margin-bottom:1.5mm; color:#201e1d; }
+          .pc-vars { font-size:6.5pt; color:#7d7979; line-height:1.45; margin-bottom:2mm; }
+          .pc-var-row { margin-bottom:.5mm; }
+          .pc-vars b { color:#201e1d; }
+          /* Card foot echoes the screen card: "TO PICK" label + vermilion total,
+             separated by an ink rule. */
+          .pc-qty  { display:flex; align-items:baseline; justify-content:space-between; gap:2mm; border-top:1.5px solid #201e1d; padding-top:1.5mm; font-family:var(--font-heading); font-weight:800; font-size:13pt; color:#ec3013; }
+          .pc-qty::before { content:"To pick"; font-size:5.5pt; letter-spacing:.1em; text-transform:uppercase; color:#7d7979; }
 
           /* ── Tracking list: one row per product ───────────────────── */
-          table.pt {
-            width: 100%;
-            border-collapse: collapse;
-            table-layout: fixed;
-          }
+          table.pt { width: 100%; border-collapse: collapse; table-layout: fixed; }
           /* Repeats the header row on every printed page */
           .pt thead { display: table-header-group; }
-          .pt th, .pt td {
-            border: 1px solid #ccc;
-            padding: 2mm 3mm;
-            vertical-align: middle;
-            text-align: left;
-          }
-          .pt th {
-            background: #eee;
-            font-size: 8pt;
-            font-weight: bold;
-          }
+          /* Full grid: vertical separators divide the three columns
+             (Image | Product & variants | Qty), horizontal ones divide rows.
+             Header keeps the strong 2px ink underline. */
+          .pt th { text-align:left; font-family:var(--font-body); font-size:7pt; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:#605d5d; padding:2mm 3mm; border:1px solid #c9c7c6; border-bottom:2px solid #201e1d; }
+          .pt td { border:1px solid #c9c7c6; padding:2.5mm 3mm; vertical-align:middle; text-align:left; }
           .pt tbody tr { page-break-inside: avoid; break-inside: avoid; }
-          .pt tbody tr:nth-child(even) { background: #fafafa; }
-
           .pt-col-img { width: 40mm; }
           .pt-col-qty { width: 24mm; text-align: center; }
-
-          .pt-col-img img {
-            width: 100%;
-            height: auto;
-            display: block;
-          }
-          .pt-noimg {
-            width: 100%;
-            height: 28mm;
-            background: #f0f0f0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 6.5pt;
-            color: #888;
-          }
-
-          .pt-title { font-size: 9.5pt; font-weight: bold; line-height: 1.3; margin-bottom: 1mm; }
-          /* Wrapper for the variant list */
-          .pt-vars  { font-size: 7.5pt; color: #555; line-height: 1.6; }
-          /* Each variant row */
+          .pt-col-img img { width: 100%; height: auto; display: block; border:1px solid #c9c7c6; }
+          .pt-noimg { width: 100%; height: 28mm; background: #eae9e9; display: flex; align-items: center; justify-content: center; font-size: 6pt; letter-spacing:.06em; text-transform:uppercase; color: #9b9797; }
+          .pt-title { font-family:var(--font-heading); font-weight:800; font-size: 10pt; line-height: 1.25; margin-bottom: 1mm; color:#201e1d; }
+          .pt-vars  { font-size: 7.5pt; color: #7d7979; line-height: 1.55; }
           .pt-var-row { margin-bottom: 0.5mm; }
-
-          .pt-qty {
-            background: #fffacd;
-            text-align: center;
-            font-size: 13pt; font-weight: bold;
-            padding: 1.5mm; border-radius: 2px;
-          }
+          .pt-vars b { color:#201e1d; }
+          .pt-qty { font-family:var(--font-heading); font-weight:800; text-align: center; font-size: 14pt; color:#ec3013; }
         }
-
         @page { size: A4 portrait; margin: 10mm; }
       `}</style>
 
       {/* ──────────────────────────────────────────────────────────────────── */}
-      {/* Hidden print section                                                 */}
-      {/* Lives in the DOM at all times; React keeps it up-to-date.           */}
-      {/* Made visible only via @media print (see CSS above).                 */}
+      {/* Print-only section — real <table> layouts so the sheet pastes into   */}
+      {/* Google Docs / Word as an editable table. Hidden on screen; revealed   */}
+      {/* by @media print, which shows only the wrapper matching printMode.     */}
       {/* ──────────────────────────────────────────────────────────────────── */}
       <div id="pick-list-print" data-print-mode={printMode}>
         <div className="ph">
-          <div className="ph-title">📦 Pick List — Unfulfilled Orders</div>
+          <div className="ph-eyebrow">Unfulfilled orders · {today}</div>
+          <div className="ph-title">Pick List</div>
           <div className="ph-meta">
-            {new Date().toLocaleDateString("en-IN", {
-              day: "2-digit",
-              month: "short",
-              year: "numeric",
-            })}
+            {printMode === "manufacturing" ? "Manufacturing list" : "Tracking list"}
             &nbsp;·&nbsp; Products: <b>{totalProducts}</b>
-            &nbsp;·&nbsp; Total items: <b>{totalItems}</b>
+            &nbsp;·&nbsp; Items to pick: <b>{totalItems}</b>
           </div>
         </div>
 
-        {/* Manufacturing list — dense 4-up table, shown when printMode === "manufacturing" */}
+        {/* Manufacturing list — dense 4-up table (printMode === "manufacturing") */}
         <div className="pg-wrap">
           <table className="pm">
             <tbody>
@@ -658,32 +679,20 @@ export default function Index() {
                 <tr key={rowIndex}>
                   {[0, 1, 2, 3].map((colIndex) => {
                     const product = pickList[rowIndex * 4 + colIndex];
-
                     return (
                       <td key={colIndex}>
                         {product && (
                           <div className="pc">
                             {product.productImage?.url ? (
                               <img
-                                src={shopifyImg(
-                                  product.productImage.url,
-                                  PRINT_IMG_WIDTH,
-                                  PRINT_IMG_QUALITY
-                                )}
-                                alt={
-                                  product.productImage?.altText ||
-                                  product.productTitle
-                                }
+                                src={shopifyImg(product.productImage.url, PRINT_IMG_WIDTH, PRINT_IMG_QUALITY)}
+                                alt={product.productImage?.altText || product.productTitle}
                               />
                             ) : (
                               <div className="pc-noimg">No image</div>
                             )}
-
                             <div className="pc-body">
-                              <div className="pc-title">
-                                {product.productTitle}
-                              </div>
-
+                              <div className="pc-title">{product.productTitle}</div>
                               {showVariantQuantity && (
                                 <div className="pc-vars">
                                   {product.variants.map((v: any, i: number) => (
@@ -698,29 +707,19 @@ export default function Index() {
                                   ))}
                                 </div>
                               )}
-
-                              {!showVariantQuantity &&
-                                (showSku || showOrderId) && (
-                                  <div className="pc-vars">
-                                    {product.variants.map((v: any, i: number) => (
-                                      <div key={i}>
-                                        {showSku && v.sku
-                                          ? `SKU: ${v.sku}`
-                                          : ""}
-                                        {showOrderId &&
-                                        v.orderNumbers?.length > 0
-                                          ? `${
-                                              showSku && v.sku ? " " : ""
-                                            }[${v.orderNumbers.join(", ")}]`
-                                          : ""}
-                                      </div>
-                                    ))}
-                                  </div>
-                                )}
-
-                              <div className="pc-qty">
-                                {product.totalQuantity}
-                              </div>
+                              {!showVariantQuantity && (showSku || showOrderId) && (
+                                <div className="pc-vars">
+                                  {product.variants.map((v: any, i: number) => (
+                                    <div key={i}>
+                                      {showSku && v.sku ? `SKU: ${v.sku}` : ""}
+                                      {showOrderId && v.orderNumbers?.length > 0
+                                        ? `${showSku && v.sku ? " " : ""}[${v.orderNumbers.join(", ")}]`
+                                        : ""}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                              <div className="pc-qty">{product.totalQuantity}</div>
                             </div>
                           </div>
                         )}
@@ -733,7 +732,7 @@ export default function Index() {
           </table>
         </div>
 
-        {/* Tracking list — structured table, shown when printMode === "tracking" */}
+        {/* Tracking list — one row per product (printMode === "tracking") */}
         <div className="pt-wrap">
           <table className="pt">
             <thead>
@@ -749,13 +748,7 @@ export default function Index() {
                   <td className="pt-col-img">
                     {product.productImage?.url ? (
                       <img
-                        /* Resized (never cropped) via Shopify's CDN — high quality
-                           enough to read jewelry detail, far smaller than the original */
-                        src={shopifyImg(
-                          product.productImage.url,
-                          PRINT_IMG_WIDTH,
-                          PRINT_IMG_QUALITY
-                        )}
+                        src={shopifyImg(product.productImage.url, PRINT_IMG_WIDTH, PRINT_IMG_QUALITY)}
                         alt={product.productImage?.altText || product.productTitle}
                       />
                     ) : (
@@ -801,487 +794,577 @@ export default function Index() {
         </div>
       </div>
 
-      {/* ──────────────────────────────────────────────────────────────────── */}
-      {/* App UI (hidden at print time via @media print { s-page: none })     */}
-      {/* ──────────────────────────────────────────────────────────────────── */}
-      <s-page>
-        {/* ── Hero ────────────────────────────────────────────────────── */}
+      <div className="pk-app">
         <div
-          style={{
-            textAlign: "center",
-            padding: "clamp(28px, 6vw, 60px) 20px clamp(20px, 4vw, 40px)",
-            background:
-              "linear-gradient(135deg, var(--s-color-bg) 0%, var(--s-color-bg-subdued) 100%)",
-            borderRadius: "0 0 16px 16px",
-            marginBottom: "40px",
-            animation: "fadeIn 0.6s ease-out",
-          }}
+          className="pk-page"
+          style={{ maxWidth: "1100px", margin: "0 auto", padding: "34px 34px 56px" }}
         >
+          {/* ── Header ─────────────────────────────────────────────── */}
           <div
+            className="pk-header pk-noprint"
             style={{
-              fontSize: "clamp(22px, 5vw, 36px)",
-              fontWeight: "bold",
-              marginBottom: "12px",
-              color: "var(--s-color-text)",
-              letterSpacing: "-0.5px",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "flex-end",
+              gap: "24px",
+              paddingBottom: "22px",
+              ...dividerRow,
             }}
           >
-            📦 Pick List Generator
-          </div>
-          <div
-            style={{
-              fontSize: "clamp(13px, 2.5vw, 16px)",
-              opacity: 0.7,
-              marginBottom: "32px",
-              color: "var(--s-color-text-subdued)",
-            }}
-          >
-            Generate and manage your unfulfilled orders with ease
-          </div>
-
-          <form onSubmit={submitPickList}>
-            <s-button
-              type="submit"
-              {...(isLoading ? { loading: true, disabled: true } : {})}
+            <div>
+              <div style={eyebrow}>Unfulfilled orders · {today}</div>
+              <h1 style={{ margin: 0, fontSize: "clamp(30px,6vw,46px)" }}>Pick List</h1>
+            </div>
+            <button
+              className="btn btn-primary pk-gen"
+              onClick={runGenerate}
+              disabled={isLoading}
+              style={{ padding: "11px 18px", fontSize: "15px" }}
             >
-              {isLoading ? "Generating…" : "Generate Pick List"}
-            </s-button>
-          </form>
+              <IconBox size={18} />
+              {isLoading ? "Generating…" : "Generate list"}
+            </button>
+          </div>
 
-          {fetcher.data?.success && (
-            <div style={statsContainer}>
-              <div style={statCard}>
-                <div
-                  style={{
-                    fontSize: "28px",
-                    fontWeight: "bold",
-                    color: "var(--s-color-interactive)",
-                    marginBottom: "8px",
-                  }}
-                >
-                  {totalProducts}
-                </div>
-                <div
-                  style={{
-                    fontSize: "12px",
-                    textTransform: "uppercase",
-                    letterSpacing: "0.5px",
-                    opacity: 0.6,
-                  }}
-                >
-                  Products
-                </div>
+          {/* ── Stats ──────────────────────────────────────────────── */}
+          {generated && !isLoading && (
+            <div
+              className="pk-stats pk-noprint"
+              style={{ display: "flex", ...dividerRow }}
+            >
+              <div style={statCell()}>
+                <div style={statNum}>{totalProducts}</div>
+                <div style={statLabel}>Products</div>
               </div>
-              <div style={statCard}>
-                <div
-                  style={{
-                    fontSize: "28px",
-                    fontWeight: "bold",
-                    color: "var(--s-color-interactive)",
-                    marginBottom: "8px",
-                  }}
-                >
-                  {totalItems}
-                </div>
-                <div
-                  style={{
-                    fontSize: "12px",
-                    textTransform: "uppercase",
-                    letterSpacing: "0.5px",
-                    opacity: 0.6,
-                  }}
-                >
-                  Total Items
-                </div>
+              <div style={statCell()}>
+                <div style={{ ...statNum, color: "var(--color-accent)" }}>{totalItems}</div>
+                <div style={statLabel}>Items to pick</div>
+              </div>
+              <div style={statCell(true)}>
+                <div style={statNum}>{unfulfilledOrders}</div>
+                <div style={statLabel}>Orders</div>
               </div>
             </div>
           )}
-        </div>
 
-        {/* ── Filter toggle ────────────────────────────────────────── */}
-        <button
-          onClick={() => setShowFilters((v) => !v)}
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "8px",
-            padding: "12px 16px",
-            background: "transparent",
-            border: "none",
-            cursor: "pointer",
-            fontSize: "15px",
-            fontWeight: "600",
-            color: "var(--s-color-text)",
-            marginTop: "24px",
-          }}
-          onMouseEnter={(e) => {
-            (e.currentTarget as HTMLElement).style.opacity = "0.7";
-          }}
-          onMouseLeave={(e) => {
-            (e.currentTarget as HTMLElement).style.opacity = "1";
-          }}
-        >
-          <span
-            style={{
-              display: "inline-block",
-              transition: "transform 300ms ease-in-out",
-              transform: showFilters ? "rotate(180deg)" : "rotate(0deg)",
-            }}
-          >
-            ▼
-          </span>
-          Advanced Filters
-        </button>
-
-        {/* ── Filter panel ─────────────────────────────────────────── */}
-        <div
-          id="filter-panel"
-          style={{
-            maxHeight: showFilters ? "1000px" : "0px",
-            opacity: showFilters ? 1 : 0,
-            overflow: "hidden",
-            transition: "all 300ms ease-in-out",
-            marginBottom: showFilters ? "24px" : "0px",
-          }}
-        >
-          <form onSubmit={submitPickList} style={filterContent}>
-            {/* Start Date */}
-            <div style={fieldWrapper(140)}>
-              <label style={labelStyle}>Start Date</label>
-              <input
-                type="date"
-                value={startDate}
-                onChange={(e) => setStartDate(e.target.value)}
-              />
-            </div>
-
-            {/* End Date */}
-            <div style={fieldWrapper(140)}>
-              <label style={labelStyle}>End Date</label>
-              <input
-                type="date"
-                value={endDate}
-                onChange={(e) => setEndDate(e.target.value)}
-              />
-            </div>
-
-            {/* Search */}
-            <div style={fieldWrapper(200)}>
-              <s-text-field
-                label="Search Product"
-                placeholder="Enter keyword…"
-                value={searchKeyword}
-                onChange={(e: any) => setSearchKeyword(e.target.value)}
-              />
-            </div>
-
-            {/* Variant drill-down — client-side, instant. Options come from the
-                variants present in the current results; picking one collapses
-                every card to just that variant. Disabled until a list exists. */}
-            <div style={fieldWrapper(180)}>
-              <label style={labelStyle}>Variant</label>
-              <select
-                value={selectedVariant}
-                onChange={(e) => setSelectedVariant(e.target.value)}
-                style={selectStyle}
-                disabled={variantOptions.length === 0}
-              >
-                <option value="">
-                  {variantOptions.length === 0
-                    ? "Generate a list first"
-                    : "All variants"}
-                </option>
-                {variantOptions.map((vt) => (
-                  <option key={vt} value={vt}>
-                    {vt}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            {/* Sort */}
-            <div style={fieldWrapper(180)}>
-              <label style={labelStyle}>Sort By</label>
-              <select
-                value={sortBy}
-                onChange={(e) => setSortBy(e.target.value)}
-                style={selectStyle}
-              >
-                <option value="alpha">Alphabetical (A–Z)</option>
-                <option value="old-to-new">Old to New</option>
-                <option value="new-to-old">New to Old</option>
-                <option value="qty-high-to-low">Highest Qty → Lowest</option>
-                <option value="qty-low-to-high">Lowest Qty → Highest</option>
-              </select>
-            </div>
-
-            {/* Display options */}
+          {/* ── Filters ────────────────────────────────────────────── */}
+          <div className="pk-noprint" style={{ marginTop: "2px" }}>
             <div
               style={{
                 display: "flex",
-                gap: "20px",
-                flexWrap: "wrap",
-                width: "100%",
-                borderTop: "1px solid var(--s-color-border-subdued)",
-                paddingTop: "16px",
-                marginTop: "4px",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "12px",
+                padding: "14px 0",
+                ...dividerRow,
               }}
             >
-              <label style={checkboxLabel}>
-                <input
-                  type="checkbox"
-                  checked={showSku}
-                  onChange={(e) => setShowSku(e.target.checked)}
-                />
-                Include SKU
-              </label>
-              <label style={checkboxLabel}>
-                <input
-                  type="checkbox"
-                  checked={showVariantQuantity}
-                  onChange={(e) => setShowVariantQuantity(e.target.checked)}
-                />
-                Include Individual Variant Quantity
-              </label>
-              <label style={checkboxLabel}>
-                <input
-                  type="checkbox"
-                  checked={showOrderId}
-                  onChange={(e) => setShowOrderId(e.target.checked)}
-                />
-                Include Order IDs
-              </label>
-            </div>
-
-            {/* Action buttons */}
-            <div
-              className="filter-actions"
-              style={{
-                display: "flex",
-                gap: "8px",
-                width: "100%",
-                flexWrap: "wrap",
-              }}
-            >
-              <s-button
-                type="submit"
-                {...(isLoading ? { loading: true, disabled: true } : {})}
-              >
-                {isLoading ? "Applying…" : "Apply"}
-              </s-button>
-              <s-button
-                type="button"
-                variant="secondary"
-                onClick={clearFilters}
-                {...(isLoading ? { disabled: true } : {})}
-              >
-                Clear
-              </s-button>
-            </div>
-          </form>
-        </div>
-
-        {/* ── Order-history limit notice ──────────────────────────── */}
-        {/* Shown when the chosen start date predates Shopify's 60-day window, */}
-        {/* so an empty (or short) list reads as a permission limit, not a bug. */}
-        {historyWarning && (
-          <div
-            style={{
-              padding: "16px",
-              backgroundColor: "var(--s-color-bg-warning)",
-              border: "1px solid var(--s-color-border-subdued)",
-              borderRadius: "8px",
-              marginTop: "16px",
-              animation: "fadeIn 0.3s ease-out",
-            }}
-          >
-            <s-paragraph>⚠️ {historyWarning}</s-paragraph>
-          </div>
-        )}
-
-        {/* ── Results ─────────────────────────────────────────────── */}
-        {fetcher.data?.success && pickList.length > 0 && (
-          <>
-            <div
-              className="print-actions"
-              style={{
-                display: "flex",
-                gap: "8px",
-                flexWrap: "wrap",
-                marginBottom: "24px",
-                marginTop: "32px",
-              }}
-            >
-              <s-button
-                onClick={() => handlePrint("manufacturing")}
-                variant="tertiary"
-              >
-                🏭 Print Manufacturing List
-              </s-button>
-              <s-button
-                onClick={() => handlePrint("tracking")}
-                variant="tertiary"
-              >
-                📋 Print Tracking List
-              </s-button>
-            </div>
-
-            <s-section heading="Products to Pick">
-              <div
+              <button
+                onClick={() => setShowFilters((v) => !v)}
                 style={{
-                  display: "grid",
-                  gridTemplateColumns:
-                    "repeat(auto-fill, minmax(min(220px, 100%), 1fr))",
-                  gap: "16px",
-                  animation: "fadeIn 0.4s ease-out",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "9px",
+                  background: "transparent",
+                  border: "none",
+                  cursor: "pointer",
+                  fontFamily: "var(--font-heading)",
+                  fontWeight: 800,
+                  fontSize: "14px",
+                  color: "var(--color-text)",
+                  padding: 0,
                 }}
               >
-                {pickList.map((product: any) => (
-                  <div
-                    key={product.productId}
-                    style={{
-                      border: "1px solid var(--s-color-border)",
-                      borderRadius: "12px",
-                      overflow: "hidden",
-                      transition: "box-shadow 200ms ease-in-out, transform 200ms ease-in-out",
-                      backgroundColor: "var(--s-color-bg)",
-                    }}
-                    onMouseEnter={(e) => {
-                      const el = e.currentTarget as HTMLElement;
-                      el.style.boxShadow = "0 8px 24px rgba(0,0,0,0.12)";
-                      el.style.transform = "translateY(-4px)";
-                    }}
-                    onMouseLeave={(e) => {
-                      const el = e.currentTarget as HTMLElement;
-                      el.style.boxShadow = "none";
-                      el.style.transform = "translateY(0)";
-                    }}
-                  >
-                    <img
-                      src={shopifyImg(product.productImage?.url, SCREEN_IMG_WIDTH)}
-                      alt={product.productImage?.altText || product.productTitle}
-                      style={{
-                        width: "100%",
-                        height: "200px",
-                        objectFit: "contain",
-                        display: "block",
-                        backgroundColor: "var(--s-color-bg-subdued)",
-                      }}
+                <IconFilter size={16} />
+                Filters
+                <span style={{ opacity: 0.6, display: "inline-flex" }}>
+                  <IconChevron up={showFilters} size={15} />
+                </span>
+              </button>
+              {selectedVariants.length > 0 && (
+                <span className="tag tag-accent">
+                  {selectedVariants.length} variant filter
+                </span>
+              )}
+            </div>
+
+            {showFilters && (
+              <>
+                <div
+                  className="pk-filter-grid"
+                  style={{
+                    display: "flex",
+                    flexWrap: "wrap",
+                    gap: "16px",
+                    alignItems: "flex-end",
+                    padding: "22px 0",
+                    ...dividerRow,
+                  }}
+                >
+                  <div className="field" style={{ flex: "1 1 130px" }}>
+                    <label>Start date</label>
+                    <input
+                      className="input"
+                      type="date"
+                      value={startDate}
+                      onChange={(e) => setStartDate(e.target.value)}
                     />
-                    <div style={{ padding: "12px" }}>
-                      <div
+                  </div>
+                  <div className="field" style={{ flex: "1 1 130px" }}>
+                    <label>End date</label>
+                    <input
+                      className="input"
+                      type="date"
+                      value={endDate}
+                      onChange={(e) => setEndDate(e.target.value)}
+                    />
+                  </div>
+                  <div className="field" style={{ flex: "2 1 200px" }}>
+                    <label>Search product</label>
+                    <input
+                      className="input"
+                      placeholder="Keyword…"
+                      value={searchKeyword}
+                      onChange={(e) => setSearchKeyword(e.target.value)}
+                    />
+                  </div>
+
+                  {/* Variant multi-select — client-side, instant. */}
+                  <div
+                    className="field"
+                    ref={variantMenuRef}
+                    style={{ flex: "1 1 180px", position: "relative" }}
+                  >
+                    <label>Variant</label>
+                    <button
+                      className="input"
+                      type="button"
+                      disabled={!variantHasOptions}
+                      aria-haspopup="listbox"
+                      aria-expanded={variantMenuOpen}
+                      onClick={() => setVariantMenuOpen((v) => !v)}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "8px",
+                        cursor: variantHasOptions ? "pointer" : "not-allowed",
+                        textAlign: "left",
+                        fontFamily: "var(--font-heading)",
+                        fontWeight: 800,
+                        fontSize: "13px",
+                        opacity: variantHasOptions ? 1 : 0.55,
+                      }}
+                    >
+                      <span
                         style={{
-                          fontWeight: "bold",
-                          marginBottom: "8px",
-                          fontSize: "14px",
-                          lineHeight: "1.4",
-                          minHeight: "28px",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
                         }}
                       >
-                        {product.productTitle}
-                      </div>
+                        {variantHasOptions ? variantLabel : "Generate a list first"}
+                      </span>
+                      <span style={{ opacity: 0.55, flex: "none", display: "inline-flex" }}>
+                        <IconChevron size={15} />
+                      </span>
+                    </button>
 
-                      {showVariantQuantity && (
-                        <div
-                          style={{
-                            fontSize: "0.85em",
-                            marginBottom: "12px",
-                            opacity: 0.7,
-                            lineHeight: "1.4",
-                          }}
-                        >
-                          {product.variants.map((variant: any, idx: number) => (
-                            <div key={idx}>
-                              {variant.variantTitle}
-                              {showSku && variant.sku && ` (${variant.sku})`}
-                              {showOrderId && variant.orderNumbers?.length > 0
-                                ? ` [${variant.orderNumbers.join(", ")}]`
-                                : ""}
-                              :{" "}
-                              <strong>{variant.quantity}</strong>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-
-                      {!showVariantQuantity && (showSku || showOrderId) && (
-                        <div
-                          style={{
-                            fontSize: "0.85em",
-                            marginBottom: "12px",
-                            opacity: 0.7,
-                            lineHeight: "1.4",
-                          }}
-                        >
-                          {product.variants.map((variant: any, idx: number) => (
-                            <div key={idx}>
-                              {showSku && variant.sku && `SKU: ${variant.sku}`}
-                              {showOrderId && variant.orderNumbers?.length > 0
-                                ? `${showSku && variant.sku ? "  " : ""}[${variant.orderNumbers.join(", ")}]`
-                                : ""}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-
+                    {variantMenuOpen && variantHasOptions && (
                       <div
+                        role="listbox"
+                        aria-multiselectable="true"
                         style={{
-                          backgroundColor: "var(--s-color-bg-warning)",
-                          padding: "12px",
-                          borderRadius: "8px",
-                          fontSize: "18px",
-                          fontWeight: "bold",
-                          textAlign: "center",
-                          color: "var(--s-color-text)",
+                          position: "absolute",
+                          top: "100%",
+                          left: 0,
+                          right: 0,
+                          zIndex: 30,
+                          marginTop: "4px",
+                          maxHeight: "250px",
+                          overflowY: "auto",
+                          background: "var(--color-bg)",
+                          border: "1px solid var(--color-divider)",
+                          boxShadow: "var(--shadow-lg)",
+                          padding: "4px",
                         }}
                       >
-                        {product.totalQuantity}
+                        {selectedVariants.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => setSelectedVariants([])}
+                            style={{
+                              width: "100%",
+                              textAlign: "left",
+                              padding: "8px 10px",
+                              background: "transparent",
+                              border: "none",
+                              color: "var(--color-accent)",
+                              fontFamily: "var(--font-heading)",
+                              fontWeight: 800,
+                              fontSize: "12px",
+                              cursor: "pointer",
+                            }}
+                          >
+                            Clear selection ({selectedVariants.length})
+                          </button>
+                        )}
+                        {variantOptions.map((vt) => (
+                          <label
+                            key={vt}
+                            role="option"
+                            aria-selected={selectedVariants.includes(vt)}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "9px",
+                              padding: "8px 10px",
+                              fontSize: "14px",
+                              cursor: "pointer",
+                              color: "var(--color-text)",
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              className="pk-chk"
+                              checked={selectedVariants.includes(vt)}
+                              onChange={() => toggleVariant(vt)}
+                            />
+                            <span
+                              style={{
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {vt}
+                            </span>
+                          </label>
+                        ))}
                       </div>
+                    )}
+                  </div>
+
+                  <div className="field" style={{ flex: "1 1 170px" }}>
+                    <label>Sort by</label>
+                    <select
+                      className="input"
+                      value={sortBy}
+                      onChange={(e) => setSortBy(e.target.value)}
+                      style={{
+                        fontFamily: "var(--font-heading)",
+                        fontWeight: 800,
+                        fontSize: "13px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <option value="alpha">Alphabetical (A–Z)</option>
+                      <option value="old-to-new">Order date · old to new</option>
+                      <option value="new-to-old">Order date · new to old</option>
+                      <option value="qty-high-to-low">Quantity · high to low</option>
+                      <option value="qty-low-to-high">Quantity · low to high</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div
+                  className="pk-toggles"
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: "16px",
+                    padding: "18px 0",
+                    ...dividerRow,
+                  }}
+                >
+                  <div style={{ display: "flex", gap: "24px", flexWrap: "wrap", fontSize: "13px" }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer" }}>
+                      <input type="checkbox" className="pk-chk" checked={showSku} onChange={(e) => setShowSku(e.target.checked)} />
+                      Include SKU
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer" }}>
+                      <input type="checkbox" className="pk-chk" checked={showVariantQuantity} onChange={(e) => setShowVariantQuantity(e.target.checked)} />
+                      Variant quantities
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer" }}>
+                      <input type="checkbox" className="pk-chk" checked={showOrderId} onChange={(e) => setShowOrderId(e.target.checked)} />
+                      Order IDs
+                    </label>
+                  </div>
+                  <button className="btn btn-secondary" onClick={clearFilters}>
+                    <IconX size={15} />
+                    Clear filters
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* ── 60-day warning ─────────────────────────────────────── */}
+          {historyWarning && (
+            <div className="pk-noprint" style={noticeBox}>
+              <span style={{ flex: "none", marginTop: "1px", display: "inline-flex" }}>
+                <IconWarn size={18} stroke="var(--color-accent-700)" />
+              </span>
+              <p style={{ margin: 0, fontSize: "13px", lineHeight: 1.55, color: "var(--color-accent-800)" }}>
+                {historyWarning}
+              </p>
+            </div>
+          )}
+
+          {/* ── Error ──────────────────────────────────────────────── */}
+          {errored && (
+            <div className="pk-noprint" style={{ ...noticeBox, padding: "18px" }}>
+              <span style={{ flex: "none", marginTop: "1px", display: "inline-flex" }}>
+                <IconError size={18} stroke="var(--color-accent-700)" />
+              </span>
+              <div>
+                <div style={{ fontFamily: "var(--font-heading)", fontWeight: 800, fontSize: "15px", color: "var(--color-accent-800)" }}>
+                  Couldn't generate the pick list
+                </div>
+                <p style={{ margin: "5px 0 0", fontSize: "13px", color: "var(--color-accent-800)" }}>
+                  {fetcher.data && "error" in fetcher.data
+                    ? (fetcher.data.error as string)
+                    : "Something went wrong reaching your store. Check the connection and try again."}
+                </p>
+                <button className="btn btn-secondary" onClick={runGenerate} style={{ marginTop: "12px" }}>
+                  Try again
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* ── Results / intro / loading / empty ──────────────────── */}
+          <div className="pk-results" data-print-mode={printMode}>
+            {showIntro && (
+              <div
+                className="pk-noprint"
+                style={{
+                  animation: "pkFade .4s ease",
+                  border: "2px solid var(--color-divider)",
+                  padding: "38px 30px",
+                  marginTop: "28px",
+                  display: "flex",
+                  gap: "22px",
+                  alignItems: "flex-start",
+                }}
+              >
+                <span style={{ flex: "none", display: "inline-flex" }}>
+                  <IconBox size={40} sw={1.6} stroke="var(--color-accent)" />
+                </span>
+                <div>
+                  <h3 style={{ margin: "0 0 6px", fontSize: "23px" }}>No pick list yet</h3>
+                  <p className="text-muted" style={{ margin: 0, maxWidth: "54ch", lineHeight: 1.6 }}>
+                    Set a date range in Filters if you need one, then hit{" "}
+                    <b style={{ color: "var(--color-text)" }}>Generate list</b> to pull every
+                    unfulfilled order into a single list to pick and pack from.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {isLoading && (
+              <div
+                className="pk-noprint"
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fill,minmax(min(200px,100%),1fr))",
+                  gap: "16px",
+                  marginTop: "28px",
+                }}
+              >
+                {Array.from({ length: 8 }).map((_, i) => (
+                  <div key={i} style={{ border: "1px solid var(--color-divider)", background: "var(--color-surface)" }}>
+                    <div style={{ aspectRatio: "1/1", background: "var(--color-neutral-200)", animation: "pkPulse 1.2s ease-in-out infinite" }} />
+                    <div style={{ padding: "14px" }}>
+                      <div style={{ height: "12px", background: "var(--color-neutral-200)", marginBottom: "9px", animation: "pkPulse 1.2s ease-in-out infinite" }} />
+                      <div style={{ height: "10px", width: "70%", background: "var(--color-neutral-200)", marginBottom: "16px", animation: "pkPulse 1.2s ease-in-out infinite" }} />
+                      <div style={{ height: "26px", background: "var(--color-neutral-200)", animation: "pkPulse 1.2s ease-in-out infinite" }} />
                     </div>
                   </div>
                 ))}
               </div>
-            </s-section>
-          </>
-        )}
+            )}
 
-        {/* ── Empty state ──────────────────────────────────────────── */}
-        {fetcher.data?.success && pickList.length === 0 && (
-          <div
-            style={{
-              textAlign: "center",
-              padding: "48px 20px",
-              opacity: 0.6,
-              animation: "fadeIn 0.3s ease-out",
-            }}
-          >
-            <div style={{ fontSize: "48px", marginBottom: "16px" }}>📭</div>
-            <div style={{ fontSize: "18px", fontWeight: "600" }}>
-              No products to pick
-            </div>
-            <div style={{ fontSize: "14px", marginTop: "8px" }}>
-              All orders are fulfilled, or no orders match your filters.
-            </div>
-          </div>
-        )}
+            {showResults && (
+              <>
+                <div
+                  className="pk-resbar pk-noprint"
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    gap: "16px",
+                    marginTop: "30px",
+                    marginBottom: "20px",
+                  }}
+                >
+                  <h2 style={{ margin: 0, fontSize: "24px" }}>
+                    Products to pick{" "}
+                    <span style={{ color: "var(--color-neutral-500)", fontSize: "17px" }}>
+                      · {totalProducts}
+                    </span>
+                  </h2>
+                  <div className="pk-print-btns" style={{ display: "flex", gap: "8px" }}>
+                    <button className="btn btn-secondary" onClick={() => handlePrint("manufacturing")}>
+                      <IconPrinter size={16} />
+                      Print manufacturing
+                    </button>
+                    <button className="btn btn-secondary" onClick={() => handlePrint("tracking")}>
+                      <IconClipboard size={16} />
+                      Print tracking
+                    </button>
+                  </div>
+                </div>
 
-        {/* ── Error state ──────────────────────────────────────────── */}
-        {fetcher.data?.success === false && (
-          <div
-            style={{
-              padding: "16px",
-              backgroundColor: "var(--s-color-bg-critical)",
-              borderRadius: "8px",
-              marginTop: "16px",
-              animation: "fadeIn 0.3s ease-out",
-            }}
-          >
-            <s-paragraph>
-              {fetcher.data.error || "An error occurred. Please try again."}
-            </s-paragraph>
+                <div
+                  className="pk-grid"
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fill,minmax(min(200px,100%),1fr))",
+                    gap: "16px",
+                  }}
+                >
+                  {pickList.map((product: any) => (
+                    <div
+                      key={product.productId}
+                      className="pk-card"
+                      style={{
+                        border: "1px solid var(--color-divider)",
+                        background: "var(--color-surface)",
+                        display: "flex",
+                        flexDirection: "column",
+                      }}
+                    >
+                      <div
+                        className="pk-card-imgwrap"
+                        style={{
+                          position: "relative",
+                          aspectRatio: "1/1",
+                          borderBottom: "1px solid var(--color-divider)",
+                          background: "var(--color-neutral-200)",
+                        }}
+                      >
+                        {product.productImage?.url ? (
+                          <img
+                            src={shopifyImg(product.productImage.url, PRINT_IMG_WIDTH, PRINT_IMG_QUALITY)}
+                            alt={product.productImage?.altText || product.productTitle}
+                            style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
+                          />
+                        ) : (
+                          <div
+                            style={{
+                              width: "100%",
+                              height: "100%",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              fontSize: "11px",
+                              color: "var(--color-neutral-600)",
+                            }}
+                          >
+                            No image
+                          </div>
+                        )}
+                      </div>
+                      <div
+                        className="pk-card-body"
+                        style={{ padding: "12px 14px 14px", display: "flex", flexDirection: "column", flex: 1 }}
+                      >
+                        <div className="pk-card-titlewrap" style={{ flex: 1, display: "flex", flexDirection: "column" }}>
+                          <div
+                            className="pk-card-title"
+                            style={{
+                              fontFamily: "var(--font-heading)",
+                              fontWeight: 800,
+                              fontSize: "14px",
+                              lineHeight: 1.25,
+                              minHeight: "35px",
+                            }}
+                          >
+                            {product.productTitle}
+                          </div>
+                          {showVarLines && (
+                            <div
+                              className="pk-vars"
+                              style={{
+                                fontSize: "12px",
+                                color: "var(--color-neutral-600)",
+                                margin: "8px 0 14px",
+                                lineHeight: 1.6,
+                                flex: 1,
+                              }}
+                            >
+                              {product.variants.map((v: any, i: number) => (
+                                <div key={i}>
+                                  {variantLine(v)}
+                                  {showVariantQuantity ? ": " : ""}
+                                  {showVariantQuantity && (
+                                    <b style={{ color: "var(--color-text)" }}>{v.quantity}</b>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                        <div
+                          className="pk-card-foot"
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            borderTop: "2px solid var(--color-divider)",
+                            paddingTop: "10px",
+                            marginTop: "auto",
+                          }}
+                        >
+                          <span style={{ fontSize: "10px", textTransform: "uppercase", letterSpacing: ".1em", color: "var(--color-neutral-600)" }}>
+                            To pick
+                          </span>
+                          <span
+                            className="pk-qty"
+                            style={{ fontFamily: "var(--font-heading)", fontWeight: 800, fontSize: "22px", color: "var(--color-accent)" }}
+                          >
+                            {product.totalQuantity}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
+            {showEmpty && (
+              <div
+                className="pk-noprint"
+                style={{
+                  animation: "pkFade .4s ease",
+                  border: "2px solid var(--color-divider)",
+                  padding: "44px 30px",
+                  marginTop: "28px",
+                  display: "flex",
+                  gap: "20px",
+                  alignItems: "center",
+                }}
+              >
+                <span style={{ flex: "none", display: "inline-flex" }}>
+                  <IconInbox size={38} stroke="var(--color-neutral-500)" />
+                </span>
+                <div>
+                  <h3 style={{ margin: "0 0 5px", fontSize: "21px" }}>No products to pick</h3>
+                  <p className="text-muted" style={{ margin: 0, maxWidth: "52ch", lineHeight: 1.6 }}>
+                    Every order is fulfilled, or nothing matches your filters. Try widening the
+                    date range or clearing the search.
+                  </p>
+                </div>
+              </div>
+            )}
           </div>
-        )}
-      </s-page>
+        </div>
+      </div>
     </>
   );
 }
