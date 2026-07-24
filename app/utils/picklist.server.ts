@@ -199,7 +199,15 @@ export function filterByProductName(
 ): PickListProduct[] {
   if (!searchKeyword?.trim()) return pickList;
   const keyword = searchKeyword.toLowerCase();
-  return pickList.filter((p) => p.productTitle.toLowerCase().includes(keyword));
+  // Match the product title OR any of its variant labels, so a variant word
+  // (e.g. "nosebone") surfaces its product even when the title doesn't contain
+  // it. The whole product is kept; the on-screen "Variant" dropdown is what
+  // collapses a result down to a single variant.
+  return pickList.filter(
+    (p) =>
+      p.productTitle.toLowerCase().includes(keyword) ||
+      p.variants.some((v) => v.variantTitle.toLowerCase().includes(keyword))
+  );
 }
 
 export function formatPickListAsText(

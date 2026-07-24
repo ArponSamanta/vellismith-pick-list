@@ -15,6 +15,15 @@ embedded = true
 # read_orders, and Shopify must grant it first: request it in the Partner
 # Dashboard under the app's API access / App Setup section. Adding it here
 # before approval will not work.
+#
+# IMPORTANT: after changing this list you MUST run `shopify app deploy`. That is
+# what pushes the scopes to Shopify's record of the app. Updating the SCOPES env
+# var on the host (Render) alone does nothing — SCOPES is only what we *request*
+# at OAuth time, and the token keeps whatever it was granted until the app is
+# re-authorised. Symptom of skipping the deploy: scopes look correct everywhere
+# in your own config, yet read_all_orders never appears in the granted scopes
+# (see fetchGrantedScopes in app/utils/picklist.server.ts) and old orders stay
+# invisible.
 scopes = "write_products,write_metaobjects,write_metaobject_definitions,read_orders,read_all_orders,read_products,read_fulfillments,read_third_party_fulfillment_orders,read_assigned_fulfillment_orders,read_merchant_managed_fulfillment_orders"
 
 [product.metafields.app.demo_info]
