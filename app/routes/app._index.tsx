@@ -443,6 +443,16 @@ export default function Index() {
     );
   };
 
+  // Select all currently visible (search-filtered) variants, unioned with any
+  // existing selection so a narrowed "select all" never drops earlier picks.
+  const selectAllVisible = () => {
+    setSelectedVariants((prev) => {
+      const set = new Set(prev);
+      for (const vt of filteredVariantOptions) set.add(vt);
+      return Array.from(set);
+    });
+  };
+
   const totalProducts = pickList.length;
   const totalItems = pickList.reduce(
     (sum: number, p: any) => sum + p.totalQuantity,
@@ -721,6 +731,21 @@ export default function Index() {
           background: var(--color-bg);
         }
         .pk-vmenu-grip { display: none; }
+        .pk-vmenu-actions {
+          display: flex; align-items: center; gap: 10px; margin-top: 8px;
+        }
+        .pk-vmenu-actions button {
+          background: transparent; border: none; padding: 2px 0; cursor: pointer;
+          font-family: var(--font-heading); font-weight: 800; font-size: 12px;
+          color: var(--color-accent);
+        }
+        .pk-vmenu-actions button:hover:not(:disabled) { text-decoration: underline; text-underline-offset: 2px; }
+        .pk-vmenu-actions button:disabled {
+          color: color-mix(in srgb, var(--color-text) 34%, transparent); cursor: default;
+        }
+        .pk-vmenu-actions-sep {
+          width: 1px; height: 12px; background: var(--color-divider);
+        }
         .pk-vmenu-list { flex: 1 1 auto; overflow-y: auto; padding: 4px; }
         .pk-vmenu-opt {
           display: flex; align-items: flex-start; gap: 9px; padding: 9px 10px;
@@ -1193,6 +1218,27 @@ export default function Index() {
                                 style={{ paddingLeft: 32 }}
                               />
                             </div>
+                            {/* Bulk actions: select / unselect all (visible). */}
+                            <div className="pk-vmenu-actions">
+                              <button
+                                type="button"
+                                onClick={selectAllVisible}
+                                disabled={filteredVariantOptions.length === 0}
+                              >
+                                Select all
+                                {variantSearch.trim()
+                                  ? ` (${filteredVariantOptions.length})`
+                                  : ""}
+                              </button>
+                              <span className="pk-vmenu-actions-sep" aria-hidden="true" />
+                              <button
+                                type="button"
+                                onClick={() => setSelectedVariants([])}
+                                disabled={selectedVariants.length === 0}
+                              >
+                                Unselect all
+                              </button>
+                            </div>
                           </div>
 
                           {/* Scrollable options. */}
@@ -1238,32 +1284,22 @@ export default function Index() {
                             )}
                           </div>
 
-                          {/* Sticky footer: clear + done. */}
+                          {/* Sticky footer: selection summary + done. */}
                           <div className="pk-vmenu-foot">
-                            <button
-                              type="button"
-                              onClick={() => setSelectedVariants([])}
-                              disabled={selectedVariants.length === 0}
+                            <span
                               style={{
-                                background: "transparent",
-                                border: "none",
-                                padding: "6px 4px",
-                                color: selectedVariants.length
-                                  ? "var(--color-accent)"
-                                  : "color-mix(in srgb, var(--color-text) 38%, transparent)",
                                 fontFamily: "var(--font-heading)",
                                 fontWeight: 800,
                                 fontSize: "12px",
-                                cursor: selectedVariants.length
-                                  ? "pointer"
-                                  : "default",
+                                color: selectedVariants.length
+                                  ? "var(--color-accent)"
+                                  : "color-mix(in srgb, var(--color-text) 55%, transparent)",
                               }}
                             >
-                              Clear
                               {selectedVariants.length
-                                ? ` (${selectedVariants.length})`
-                                : ""}
-                            </button>
+                                ? `${selectedVariants.length} selected`
+                                : "All variants"}
+                            </span>
                             <button
                               type="button"
                               className="btn btn-primary"
