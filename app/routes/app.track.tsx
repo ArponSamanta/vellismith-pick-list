@@ -11,22 +11,19 @@
  * both, which keeps one code path working identically on touch and mouse.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import type {
-  ActionFunctionArgs,
-  LoaderFunctionArgs,
-  ShouldRevalidateFunction,
-} from "react-router";
-import { useFetcher, useLoaderData, useRevalidator } from "react-router";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useFetcher } from "react-router";
 
 import { authenticate } from "../shopify.server";
 import type { OrderLine } from "../utils/picklist.server";
+import type { loader as boardLoader } from "./app.track.board";
 import {
-  getBoard,
   setPromisedDate,
   setStatus,
   type TrackedLine,
 } from "../utils/tracker.server";
+
 import {
   BOARD_COLUMNS,
   COLUMN_LABELS,
@@ -44,22 +41,21 @@ import {
   type TrackStatus,
 } from "../utils/tracking";
 
+/** Where the board's data lives. Must match app.track.board's route path. */
+const BOARD_ROUTE = "/app/track/board";
+
 // ─── Server ───────────────────────────────────────────────────────────────
 
+/**
+ * Deliberately trivial: just the auth check.
+ *
+ * Anything expensive here delays the whole navigation, because React Router
+ * keeps the previous route on screen until this resolves. The board's data
+ * comes from app.track.board instead, fetched once this page is rendered.
+ */
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
-  try {
-    // Counts are recomputed on the client anyway (they follow the search
-    // filter), so only the lines are worth sending down the wire.
-    const { lines } = await getBoard(admin, session.shop);
-    return { lines, error: null as string | null };
-  } catch (error) {
-    console.error("[track] loader error:", error);
-    return {
-      lines: [] as TrackedLine[],
-      error: "Couldn't load orders from Shopify. Please try again.",
-    };
-  }
+  await authenticate.admin(request);
+  return null;
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -141,20 +137,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 };
 
-/**
- * Don't re-fetch Shopify after our own writes.
- *
- * A status or promised-date change only touches OUR database — Shopify's
- * order data is unchanged — yet the default behaviour re-runs the loader,
- * which means a full two-phase order sweep on every single tap. Over mobile
- * data that turns a one-second action into several. The board applies the
- * change optimistically instead, so the only cost per tap is a small POST.
- *
- * Navigations and the explicit Refresh button still revalidate normally.
- */
-export const shouldRevalidate: ShouldRevalidateFunction = (args) =>
-  args.formMethod === "POST" ? false : args.defaultShouldRevalidate;
-
 // ─── Icons ────────────────────────────────────────────────────────────────
 
 const iconAttrs = (size: number, sw = 2) => ({
@@ -225,9 +207,28 @@ function shopifyImg(url: string | null, size: number): string | null {
 // ─── Component ────────────────────────────────────────────────────────────
 
 export default function TrackPage() {
-  const { lines, error } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
-  const revalidator = useRevalidator();
+
+  // Board data arrives after this page renders — see app.track.board.
+  const board = useFetcher<typeof boardLoader>();
+  const loadedRef = useRef(false);
+  useEffect(() => {
+    if (loadedRef.current) return;
+    loadedRef.current = true;
+    board.load(BOARD_ROUTE);
+  }, [board]);
+
+  /**
+   * Memoised deliberately. `board.data?.lines ?? []` would hand back a NEW
+   * empty array on every render while the data is still loading, and `lines`
+   * is a dependency of the effect that clears optimistic overrides — so each
+   * render would set state, re-render, and loop forever. Keyed on board.data,
+   * the fallback array stays identical between renders.
+   */
+  const lines = useMemo(() => board.data?.lines ?? [], [board.data]);
+  const error = board.data?.error ?? null;
+  const loadingBoard = board.state === "loading" || board.data === undefined;
+  const refresh = useCallback(() => board.load(BOARD_ROUTE), [board]);
 
   const [search, setSearch] = useState("");
   const [mobileColumn, setMobileColumn] = useState<BoardColumn | "ALL">("ALL");
@@ -289,8 +290,8 @@ export default function TrackPage() {
     queue.current = [];
     setOverrides(new Map());
     setSaveError(data.error ?? "Couldn't save that change.");
-    revalidator.revalidate();
-  }, [fetcher.state, fetcher.data, revalidator]);
+    refresh();
+  }, [fetcher.state, fetcher.data, refresh]);
 
   /** Loader data is authoritative — discard the optimistic layer. */
   useEffect(() => {
@@ -449,11 +450,11 @@ export default function TrackPage() {
               {pendingWrites && <span className="tk-saving">Saving…</span>}
               <button
                 className="btn btn-secondary"
-                onClick={() => revalidator.revalidate()}
-                disabled={revalidator.state !== "idle"}
+                onClick={refresh}
+                disabled={board.state !== "idle"}
               >
                 <IconRefresh />
-                {revalidator.state !== "idle" ? "Refreshing…" : "Refresh"}
+                {board.state !== "idle" ? "Refreshing…" : "Refresh"}
               </button>
             </div>
           </header>
@@ -516,7 +517,24 @@ export default function TrackPage() {
           )}
 
           {/* Board */}
-          {filtered.length === 0 && !error ? (
+          {loadingBoard ? (
+            /* The page itself is already on screen; only the board is still
+               coming. Skeleton columns keep the layout stable so nothing
+               jumps when the data lands. */
+            <div className="tk-board" aria-busy="true">
+              {BOARD_COLUMNS.slice(0, 4).map((col) => (
+                <section key={col} className="tk-col">
+                  <header className="tk-col-head">
+                    <span className="tk-col-name">{COLUMN_LABELS[col]}</span>
+                  </header>
+                  <div className="tk-col-body">
+                    <div className="tk-skel" />
+                    <div className="tk-skel" />
+                  </div>
+                </section>
+              ))}
+            </div>
+          ) : filtered.length === 0 && !error ? (
             <div className="tk-empty">
               <IconEmpty />
               <p>
@@ -885,6 +903,10 @@ const TRACK_CSS = `
 }
 .tk-col-body { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
 .tk-col-empty { margin: 0; padding: 10px 2px; color: var(--color-neutral-600); }
+.tk-skel {
+  height: 74px; background: var(--color-bg);
+  border: 1px solid var(--color-divider); animation: tkPulse 1.3s ease-in-out infinite;
+}
 
 .tk-card {
   background: var(--color-bg); border: 1px solid var(--color-divider);
