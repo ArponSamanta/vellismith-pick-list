@@ -22,6 +22,18 @@ import {
   filterByProductName,
   fetchGrantedScopes,
 } from "../utils/picklist.server";
+// Static for the same reason as above — never switch this to await import().
+import { getStageMap } from "../utils/tracker.server";
+import {
+  COLUMN_LABELS,
+  STAGES,
+  STAGE_LABELS,
+  UNTRIAGED,
+  columnFor,
+  isStage,
+  isStatus,
+  type BoardColumn,
+} from "../utils/tracking";
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
@@ -61,7 +73,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
 
   try {
     const formData = await request.formData();
@@ -83,6 +95,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     if (searchKeyword) {
       pickList = filterByProductName(pickList, searchKeyword);
+    }
+
+    // Stamp each constituent order line with its production stage so the
+    // client can filter the list by stage without another round-trip. One
+    // query for the whole list; lines with no tracker row stay untriaged.
+    const lineIds = pickList.flatMap((p: any) =>
+      p.variants.flatMap((v: any) => v.lines.map((l: any) => l.lineItemId))
+    );
+    const stageMap = await getStageMap(session.shop, lineIds);
+    for (const p of pickList as any[]) {
+      for (const v of p.variants) {
+        for (const l of v.lines) {
+          const t = stageMap.get(l.lineItemId);
+          l.status = t?.status ?? null;
+          l.stage = t?.stage ?? null;
+        }
+      }
     }
 
     const formattedText = formatPickListAsText(pickList, {
@@ -314,6 +343,9 @@ export default function Index() {
   // Empty means "all variants" (no collapse). This never hits the server — it
   // just reshapes the already-fetched list, so switching variants is instant.
   const [selectedVariants, setSelectedVariants] = useState<string[]>([]);
+  // Production-stage narrowing, e.g. "just what's waiting to be cast".
+  // "ALL" = no stage filter (the default).
+  const [stageFilter, setStageFilter] = useState<BoardColumn | "ALL">("ALL");
   const [variantMenuOpen, setVariantMenuOpen] = useState(false);
   // Free-text filter for the (potentially long) variant dropdown. Default is
   // empty = show every variant; typing narrows the list client-side.
@@ -340,15 +372,65 @@ export default function Index() {
 
   // Every distinct variant title present in the current results, for the
   // "Variant" drill-down dropdown. Recomputed whenever a new list arrives.
+  /**
+   * The list narrowed to one production stage.
+   *
+   * Filtering happens at the ORDER LINE level, not the product level: a
+   * product can have three pieces in Casting and two in Polishing, and asking
+   * for "Casting" must show a quantity of three. So we keep only the matching
+   * lines, then rebuild every number derived from them — the variant's
+   * quantity, its order numbers, and the product total.
+   */
+  const stageFiltered: any[] = useMemo(() => {
+    if (stageFilter === "ALL") return rawPickList;
+
+    return rawPickList
+      .map((p: any) => {
+        const variants = p.variants
+          .map((v: any) => {
+            const lines = (v.lines ?? []).filter(
+              (l: any) =>
+                columnFor(
+                  isStatus(l.status) ? l.status : null,
+                  isStage(l.stage) ? l.stage : null
+                ) === stageFilter
+            );
+            if (lines.length === 0) return null;
+            return {
+              ...v,
+              lines,
+              quantity: lines.reduce((s: number, l: any) => s + l.quantity, 0),
+              orderNumbers: Array.from(
+                new Set(lines.map((l: any) => l.orderName))
+              ),
+            };
+          })
+          .filter(Boolean);
+
+        if (variants.length === 0) return null;
+        return {
+          ...p,
+          variants,
+          totalQuantity: variants.reduce(
+            (s: number, v: any) => s + v.quantity,
+            0
+          ),
+        };
+      })
+      .filter(Boolean);
+  }, [rawPickList, stageFilter]);
+
+  // Variant options follow the stage filter, so the dropdown only ever offers
+  // variants that are actually present in what's on screen.
   const variantOptions: string[] = useMemo(() => {
     const set = new Set<string>();
-    for (const p of rawPickList) {
+    for (const p of stageFiltered) {
       for (const v of p.variants) set.add(v.variantTitle);
     }
     return Array.from(set).sort((a, b) =>
       a.toLowerCase().localeCompare(b.toLowerCase())
     );
-  }, [rawPickList]);
+  }, [stageFiltered]);
 
   // The variant options actually shown in the dropdown, narrowed by the search
   // box. Empty search = every variant (the default).
@@ -365,8 +447,8 @@ export default function Index() {
     const chosen = new Set(selectedVariants);
     let list =
       selectedVariants.length === 0
-        ? rawPickList.slice()
-        : rawPickList
+        ? stageFiltered.slice()
+        : stageFiltered
             .map((p) => {
               const variants = p.variants.filter((v: any) =>
                 chosen.has(v.variantTitle)
@@ -398,7 +480,7 @@ export default function Index() {
       }
     });
     return list;
-  }, [rawPickList, selectedVariants, sortBy]);
+  }, [stageFiltered, selectedVariants, sortBy]);
 
   // Drop any selected variants that are no longer present (new list generated,
   // keyword changed) so we never show an empty result for a stale selection.
@@ -472,6 +554,9 @@ export default function Index() {
     month: "short",
     year: "numeric",
   });
+  const stageLabel =
+    stageFilter === "ALL" ? "All stages" : COLUMN_LABELS[stageFilter];
+
   const variantLabel =
     selectedVariants.length === 0
       ? "All variants"
@@ -869,10 +954,20 @@ export default function Index() {
       {/* ──────────────────────────────────────────────────────────────────── */}
       <div id="pick-list-print" data-print-mode={printMode}>
         <div className="ph">
-          <div className="ph-eyebrow">Unfulfilled orders · {today}</div>
+          <div className="ph-eyebrow">
+            Unfulfilled orders · {today}
+            {/* A stage-filtered sheet is a PARTIAL list. Say so on the paper —
+                otherwise the bench has no way to tell it isn't everything. */}
+            {stageFilter !== "ALL" && ` · ${stageLabel}`}
+          </div>
           <div className="ph-title">Pick List</div>
           <div className="ph-meta">
             {printMode === "manufacturing" ? "Manufacturing list" : "Tracking list"}
+            {stageFilter !== "ALL" && (
+              <>
+                &nbsp;·&nbsp; Stage: <b>{stageLabel}</b>
+              </>
+            )}
             &nbsp;·&nbsp; Products: <b>{totalProducts}</b>
             &nbsp;·&nbsp; Items to pick: <b>{totalItems}</b>
           </div>
@@ -1088,11 +1183,16 @@ export default function Index() {
                   <IconChevron up={showFilters} size={15} />
                 </span>
               </button>
-              {selectedVariants.length > 0 && (
-                <span className="tag tag-accent">
-                  {selectedVariants.length} variant filter
-                </span>
-              )}
+              <span style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                {stageFilter !== "ALL" && (
+                  <span className="tag tag-accent">{stageLabel}</span>
+                )}
+                {selectedVariants.length > 0 && (
+                  <span className="tag tag-accent">
+                    {selectedVariants.length} variant filter
+                  </span>
+                )}
+              </span>
             </div>
 
             {showFilters && (
@@ -1316,6 +1416,34 @@ export default function Index() {
                         </div>
                       </>
                     )}
+                  </div>
+
+                  {/* Production stage — narrows the list to one bench's work,
+                      e.g. print just what's waiting to be cast. */}
+                  <div className="field" style={{ flex: "1 1 160px" }}>
+                    <label>Stage</label>
+                    <select
+                      className="input"
+                      value={stageFilter}
+                      onChange={(e) =>
+                        setStageFilter(e.target.value as BoardColumn | "ALL")
+                      }
+                      style={{
+                        fontFamily: "var(--font-heading)",
+                        fontWeight: 800,
+                        fontSize: "13px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <option value="ALL">All stages</option>
+                      <option value={UNTRIAGED}>Untriaged</option>
+                      {STAGES.map((s) => (
+                        <option key={s} value={s}>
+                          {STAGE_LABELS[s]}
+                        </option>
+                      ))}
+                      <option value="READY_TO_SHIP">Ready to ship</option>
+                    </select>
                   </div>
 
                   <div className="field" style={{ flex: "1 1 170px" }}>

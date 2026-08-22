@@ -9,8 +9,8 @@ generator client {
 // enough when changing adapters.
 // See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
-  provider = "sqlite"
-  url      = "file:dev.sqlite"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 model Session {
@@ -31,4 +31,76 @@ model Session {
   emailVerified Boolean?  @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
+}
+
+// ─── Production tracker ────────────────────────────────────────────────────
+// One row per unfulfilled ORDER LINE that someone has triaged. Rows are only
+// created when a status is first set, so "untriaged" needs no storage — an
+// order line with no row here simply lands in the board's Untriaged column.
+//
+// Shopify remains the source of truth for WHAT is outstanding; this table
+// only records WHERE each piece is in production. That means a shipped order
+// disappears from the board on its own, with no cleanup job.
+//
+// status/stage are plain strings, not enums — see app/utils/tracking.ts.
+
+model TrackedItem {
+  id     String @id @default(cuid())
+  shop   String
+
+  // Shopify identity. lineItemId is the stable join key back to the order.
+  orderId    String // gid://shopify/Order/…
+  orderName  String // "#3205"
+  lineItemId String // gid://shopify/LineItem/…
+
+  // Snapshot of the product at triage time, so the board renders without a
+  // second round-trip to Shopify and still reads correctly if a product is
+  // later renamed or deleted.
+  productTitle String
+  variantTitle String
+  sku          String?
+  quantity     Int
+  imageUrl     String?
+
+  // Nullable = untriaged. A row can exist with no status at all: reverting out
+  // of Design returns the item to untriaged without discarding its promised
+  // date or movement history, and a promised date can be set at intake before
+  // anyone decides make-vs-ship.
+  status String? // IN_MANUFACTURE | READY_TO_SHIP
+  stage  String? // DESIGN | CASTING | WORKSHOP | SETTING | POLISHING | PLATING
+  note   String?
+
+  // Calendar day promised to the customer, as "YYYY-MM-DD" — deliberately a
+  // string, not a DateTime. See app/utils/tracking.ts for why.
+  promisedDate String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  events TrackedItemEvent[]
+
+  // One tracking row per line item per shop.
+  @@unique([shop, lineItemId])
+  // Serves the board's "everything at this stage" query.
+  @@index([shop, status, stage])
+}
+
+// Append-only movement log. Cheap to write, and what later answers
+// "this ring has been sitting in Setting for nine days".
+model TrackedItemEvent {
+  id     String      @id @default(cuid())
+  itemId String
+  item   TrackedItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  fromStatus String?
+  fromStage  String?
+  toStatus   String? // null = reverted to untriaged
+  toStage    String?
+
+  // Staff identity when Shopify gives us one. Offline session tokens carry no
+  // user, so this is frequently null; the timestamp is always reliable.
+  by String?
+  at DateTime @default(now())
+
+  @@index([itemId, at])
 }

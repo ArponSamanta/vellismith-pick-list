@@ -27,12 +27,30 @@ interface PickListProduct {
   latestCreatedAt: string;
 }
 
+/**
+ * One order line inside a variant group.
+ *
+ * The aggregated quantity is the sum of these. Keeping the constituents lets
+ * the client filter a pick list by production stage — "everything waiting to
+ * be cast" — and recompute totals without another round-trip, the same way
+ * the variant drill-down works.
+ */
+interface PickLine {
+  lineItemId: string;
+  orderName: string;
+  quantity: number;
+  /** Production stage, attached by the route after a tracker lookup. */
+  stage?: string | null;
+  status?: string | null;
+}
+
 interface VariantGroup {
   variantId: string;
   variantTitle: string;
   sku: string | null;
   quantity: number;
   orderNumbers: string[];
+  lines: PickLine[];
 }
 
 interface DateRangeOptions {
@@ -157,6 +175,95 @@ export async function generatePickList(
     return sortPickList(pickList, options?.sortBy ?? "alpha");
   } catch (error) {
     console.error("[picklist] generatePickList error:", error);
+    throw error;
+  }
+}
+
+/**
+ * One outstanding ORDER LINE — the unit the production tracker works in.
+ *
+ * Deliberately NOT aggregated by product the way the pick list is: the whole
+ * point of the tracker is that order #3205's ring can sit in Casting while an
+ * identical ring for #3210 is already being polished.
+ */
+export interface OrderLine {
+  lineItemId: string; // gid://shopify/LineItem/… — stable join key
+  orderId: string;
+  orderName: string;
+  orderCreatedAt: string;
+  productId: string;
+  productTitle: string;
+  productType: string;
+  variantId: string;
+  variantTitle: string;
+  sku: string | null;
+  quantity: number; // remainingQuantity — units still owed
+  imageUrl: string | null;
+}
+
+/**
+ * Every unfulfilled order line, flat.
+ *
+ * Same two-phase fetch as generatePickList (cheap IDs, then alias-batched
+ * detail) — it just keeps the lines separate instead of folding them into a
+ * product map. Because it reads `remainingQuantity` from live fulfillment
+ * orders, a shipped line simply stops appearing, which is what lets the
+ * tracker board stay correct without any cleanup job.
+ */
+export async function fetchOrderLines(
+  admin: AdminApiContext,
+  options?: DateRangeOptions
+): Promise<OrderLine[]> {
+  try {
+    const [unfulfilledIds, partialIds] = await Promise.all([
+      fetchOrderIds(admin, "unfulfilled", options),
+      fetchOrderIds(admin, "partial", options),
+    ]);
+
+    const allIds = [...new Set([...unfulfilledIds, ...partialIds])];
+    if (allIds.length === 0) return [];
+
+    const lines: OrderLine[] = [];
+    const seenLineItemIds = new Set<string>();
+
+    await streamOrders(admin, allIds, (order) => {
+      for (const { node: fo } of order.fulfillmentOrders!.edges) {
+        // Same status gate as the pick list: only work that is actually
+        // actionable. CLOSED / CANCELLED / ON_HOLD / SCHEDULED are skipped.
+        if (fo.status !== "OPEN" && fo.status !== "IN_PROGRESS") continue;
+        if (!fo.lineItems?.edges) continue;
+
+        for (const { node: li } of fo.lineItems.edges) {
+          if (li.remainingQuantity <= 0) continue;
+
+          const v = li.variant;
+          if (!v?.product) continue; // product deleted from Shopify
+
+          if (seenLineItemIds.has(li.id)) continue;
+          seenLineItemIds.add(li.id);
+
+          lines.push({
+            lineItemId: li.id,
+            orderId: order.id,
+            orderName: order.name,
+            orderCreatedAt: order.createdAt,
+            productId: v.product.id,
+            productTitle: v.product.title,
+            productType: v.product.productType,
+            variantId: v.id,
+            variantTitle: v.title,
+            sku: v.sku,
+            quantity: li.remainingQuantity,
+            imageUrl: v.product.featuredImage?.url ?? null,
+          });
+        }
+      }
+    });
+
+    console.log(`[tracker] ${allIds.length} orders → ${lines.length} open lines`);
+    return lines;
+  } catch (error) {
+    console.error("[tracker] fetchOrderLines error:", error);
     throw error;
   }
 }
@@ -524,15 +631,19 @@ function buildBatchQuery(orderIds: string[]): string {
   return `query BatchFulfillmentOrders {\n${aliases.join("\n")}\n}`;
 }
 
-async function fetchFulfillmentData(
+/**
+ * Runs the phase-2 alias-batched fetch and hands each fetched order to `visit`.
+ *
+ * Extracted so every consumer (the aggregated pick list, the per-line tracker)
+ * shares one copy of the batching, concurrency and throttle-retry tuning —
+ * those numbers were arrived at painfully (see the constants above) and must
+ * not drift apart between callers.
+ */
+async function streamOrders(
   admin: AdminApiContext,
-  orderIds: string[]
-): Promise<PickListProduct[]> {
-  const productMap = new Map<string, PickListProduct>();
-  // Deduplication guard — a line item should only appear in one FO, but
-  // this protects against any edge-case double-count.
-  const seenLineItemIds = new Set<string>();
-
+  orderIds: string[],
+  visit: (order: FetchedOrder) => void
+): Promise<void> {
   // Split IDs into fixed-size alias batches.
   const batches: string[][] = [];
   for (let i = 0; i < orderIds.length; i += ORDERS_PER_BATCH) {
@@ -568,10 +679,24 @@ async function fetchFulfillmentData(
       for (let j = 0; j < count; j++) {
         const order = data.data?.[`o${j}`] as FetchedOrder | undefined;
         if (!order?.fulfillmentOrders?.edges) continue;
-        processOrderFulfillments(order, productMap, seenLineItemIds);
+        visit(order);
       }
     }
   }
+}
+
+async function fetchFulfillmentData(
+  admin: AdminApiContext,
+  orderIds: string[]
+): Promise<PickListProduct[]> {
+  const productMap = new Map<string, PickListProduct>();
+  // Deduplication guard — a line item should only appear in one FO, but
+  // this protects against any edge-case double-count.
+  const seenLineItemIds = new Set<string>();
+
+  await streamOrders(admin, orderIds, (order) =>
+    processOrderFulfillments(order, productMap, seenLineItemIds)
+  );
 
   return Array.from(productMap.values());
 }
@@ -631,9 +756,17 @@ function processOrderFulfillments(
           sku: v.sku,
           quantity: 0,
           orderNumbers: [],
+          lines: [],
         };
         pg.variants.push(vg);
       }
+
+      // Keep the constituent line so the client can filter by stage later.
+      vg.lines.push({
+        lineItemId: li.id,
+        orderName: order.name,
+        quantity: li.remainingQuantity,
+      });
 
       vg.quantity += li.remainingQuantity;
       pg.totalQuantity += li.remainingQuantity;
