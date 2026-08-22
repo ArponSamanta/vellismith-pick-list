@@ -17,8 +17,20 @@ export default function App() {
 
   return (
     <AppProvider embedded apiKey={apiKey}>
+      {/* rel="home" tells App Bridge which route is the app's home. Without
+          it, App Bridge doesn't recognise the other entries as valid
+          destinations and silently bounces the click back to home — which
+          looks exactly like the nav link doing nothing. The home entry is
+          hidden from the rendered menu; Shopify links the app title to it. */}
       <s-app-nav>
-        <s-link href="/app">Home</s-link>
+        {/* eslint-disable-next-line @typescript-eslint/no-explicit-any --
+            `rel` is documented on s-link and is present in
+            @shopify/app-bridge-types' BaseElementAttributes, but the Polaris
+            web-component React types that JSX resolves for <s-link> omit it.
+            Spread so the attribute still reaches the DOM. */}
+        <s-link href="/app" {...({ rel: "home" } as any)}>
+          Home
+        </s-link>
         <s-link href="/app/track">Track</s-link>
         <s-link href="/app/credit">Credit</s-link>
       </s-app-nav>
