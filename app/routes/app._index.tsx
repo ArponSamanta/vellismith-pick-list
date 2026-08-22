@@ -969,7 +969,7 @@ export default function Index() {
               </>
             )}
             &nbsp;·&nbsp; Products: <b>{totalProducts}</b>
-            &nbsp;·&nbsp; Items to pick: <b>{totalItems}</b>
+            &nbsp;·&nbsp; Pieces to pick: <b>{totalItems}</b>
           </div>
         </div>
 
@@ -1140,7 +1140,9 @@ export default function Index() {
               </div>
               <div style={statCell()}>
                 <div style={{ ...statNum, color: "var(--color-accent)" }}>{totalItems}</div>
-                <div style={statLabel}>Items to pick</div>
+                {/* "Pieces", not "items" — the same word the Track board uses,
+                    so the two pages' totals visibly describe the same thing. */}
+                <div style={statLabel}>Pieces to pick</div>
               </div>
               <div style={statCell(true)}>
                 <div style={statNum}>{unfulfilledOrders}</div>

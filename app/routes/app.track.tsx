@@ -193,6 +193,17 @@ function ageLabel(iso: string | null): string | null {
   return `${days} days`;
 }
 
+/**
+ * Total pieces across a set of lines.
+ *
+ * A line's quantity can exceed 1, so the number of CARDS and the number of
+ * PIECES are different figures. The pick list reports pieces; the board is
+ * organised by line. Both are shown everywhere so they reconcile.
+ */
+function pieces(lines: TrackedLine[]): number {
+  return lines.reduce((sum, l) => sum + l.quantity, 0);
+}
+
 function shopifyImg(url: string | null, size: number): string | null {
   if (!url) return null;
   try {
@@ -356,9 +367,9 @@ export default function TrackPage() {
     return map;
   }, [filtered]);
 
-  const inManufacture = filtered.filter(
+  const inManufactureLines = filtered.filter(
     (l) => l.column !== UNTRIAGED && l.column !== "READY_TO_SHIP"
-  ).length;
+  );
 
   /** The Shopify snapshot every write carries — see the action for why. */
   const snapshotOf = (line: TrackedLine): Record<string, string> => ({
@@ -459,29 +470,41 @@ export default function TrackPage() {
             </div>
           </header>
 
-          {/* Stats */}
+          {/* Stats.
+              Every figure is stated twice — order lines AND pieces — because
+              they differ: one line for three rings is 1 line but 3 pieces.
+              The pick list counts pieces ("Items to pick"), so showing both
+              makes the two pages reconcile at a glance instead of looking
+              like a discrepancy. */}
           <div className="tk-stats">
-            <div>
-              <div className="tk-stat-n">{filtered.length}</div>
-              <div className="tk-stat-l">Open lines</div>
-            </div>
-            <div>
-              <div className="tk-stat-n tk-accent">{inManufacture}</div>
-              <div className="tk-stat-l">In manufacture</div>
-            </div>
-            <div>
-              <div className="tk-stat-n">
-                {byColumn.get("READY_TO_SHIP")?.length ?? 0}
+            {(
+              [
+                ["Open lines", filtered, false],
+                ["In manufacture", inManufactureLines, true],
+                ["Ready to ship", byColumn.get("READY_TO_SHIP") ?? [], false],
+                ["Untriaged", byColumn.get(UNTRIAGED) ?? [], false],
+              ] as Array<[string, TrackedLine[], boolean]>
+            ).map(([label, group, accent], i, all) => (
+              <div key={label} className={i === all.length - 1 ? "tk-stat-last" : undefined}>
+                <div className={accent ? "tk-stat-n tk-accent" : "tk-stat-n"}>
+                  {group.length.toLocaleString()}
+                </div>
+                <div className="tk-stat-l">
+                  {label === "Open lines" ? "Order lines" : label}
+                </div>
+                <div className="tk-stat-sub">
+                  {pieces(group).toLocaleString()} pieces
+                </div>
               </div>
-              <div className="tk-stat-l">Ready to ship</div>
-            </div>
-            <div className="tk-stat-last">
-              <div className="tk-stat-n">
-                {byColumn.get(UNTRIAGED)?.length ?? 0}
-              </div>
-              <div className="tk-stat-l">Untriaged</div>
-            </div>
+            ))}
           </div>
+
+          {/* Explains the two figures once, so nobody has to reverse-engineer
+              why the pick list's total is larger than the card count. */}
+          <p className="tk-legend">
+            An order line can be for several pieces, so counts read{" "}
+            <b>lines/pieces</b>. The pick list totals <b>pieces</b>.
+          </p>
 
           {/* Search */}
           <div className="tk-toolbar">
@@ -559,7 +582,14 @@ export default function TrackPage() {
                   >
                     <header className="tk-col-head">
                       <span className="tk-col-name">{COLUMN_LABELS[col]}</span>
-                      <span className="tk-col-count">{items.length}</span>
+                      {/* cards · pieces — same reason as the stats bar. */}
+                      <span
+                        className="tk-col-count"
+                        title={`${items.length} order lines · ${pieces(items)} pieces`}
+                      >
+                        {items.length}
+                        <span className="tk-col-pcs">/{pieces(items)}</span>
+                      </span>
                     </header>
 
                     <div className="tk-col-body">
@@ -848,6 +878,16 @@ const TRACK_CSS = `
   font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
   color: var(--color-neutral-600); margin-top: 6px;
 }
+/* The piece count under each line count — the figure the pick list reports. */
+.tk-stat-sub {
+  font-family: var(--font-heading); font-weight: 800; font-size: 11px;
+  color: var(--color-text); margin-top: 3px;
+}
+.tk-col-pcs { opacity: .5; font-weight: 800; }
+.tk-legend {
+  font-size: 11px; color: var(--color-neutral-600); padding: 10px 0 0;
+}
+.tk-legend b { font-family: var(--font-heading); color: var(--color-text); }
 
 .tk-toolbar { padding: 18px 0; }
 .tk-app .input {
