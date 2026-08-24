@@ -130,12 +130,38 @@ const ORDERS_PER_PAGE = 250;
  * Reduce these further if Shopify still returns THROTTLED / query-cost errors;
  * raise ITEMS_PER_FO / FO_PER_ORDER only if orders start truncating.
  */
-const ORDERS_PER_BATCH = 5;
+const ORDERS_PER_BATCH = 10;
 const FO_PER_ORDER = 2;  // fulfillmentOrders(first:) — Vellismith is single-location so 1 is typical
 const ITEMS_PER_FO = 20; // lineItems(first:) per FO — plenty for jewelry orders (typically 1-10)
 
 /** Alias-batch requests to fire in parallel per round. */
 const CONCURRENT_BATCHES = 2;
+
+/**
+ * Why 10 × 2 rather than the earlier 5 × 2.
+ *
+ * The wall-clock cost of phase 2 is dominated by the NUMBER OF ROUND TRIPS,
+ * not by throttling: one round trip covered 10 orders (5 per batch × 2 in
+ * parallel), so several hundred unfulfilled orders meant 40+ sequential
+ * requests at a few hundred ms each — the reason the tracker took so long to
+ * appear on a busy store.
+ *
+ * Meanwhile the rate-limit budget was barely touched. Shopify checks the
+ * REQUESTED cost against a 1 000-point bucket before running a query:
+ *   per batch      = ORDERS_PER_BATCH × (1 + FO_PER_ORDER + FO_PER_ORDER × ITEMS_PER_FO)
+ *                  = 10 × (1 + 2 + 2 × 20) = 10 × 43 = 430
+ *   in flight      = CONCURRENT_BATCHES × 430 = 860   — still under 1 000
+ * Doubling the batch halves the round trips for the same concurrency.
+ *
+ * Note the bucket is refunded the difference between requested and ACTUAL
+ * cost, and a typical jewelry order has one fulfillment order with a couple
+ * of line items — actual cost per batch is a small fraction of 430 — so
+ * sustained throughput was never the constraint either.
+ *
+ * Do not raise CONCURRENT_BATCHES to 3 without lowering ORDERS_PER_BATCH:
+ * 3 × 430 = 1 290 exceeds the bucket and is exactly the shape of the
+ * throttling bug that once silently dropped orders.
+ */
 
 // ─── Exported API ─────────────────────────────────────────────────────────────
 
@@ -214,6 +240,7 @@ export async function fetchOrderLines(
   admin: AdminApiContext,
   options?: DateRangeOptions
 ): Promise<OrderLine[]> {
+  const t0 = Date.now();
   try {
     const [unfulfilledIds, partialIds] = await Promise.all([
       fetchOrderIds(admin, "unfulfilled", options),
@@ -222,6 +249,7 @@ export async function fetchOrderLines(
 
     const allIds = [...new Set([...unfulfilledIds, ...partialIds])];
     if (allIds.length === 0) return [];
+    const t1 = Date.now();
 
     const lines: OrderLine[] = [];
     const seenLineItemIds = new Set<string>();
@@ -260,7 +288,17 @@ export async function fetchOrderLines(
       }
     });
 
-    console.log(`[tracker] ${allIds.length} orders → ${lines.length} open lines`);
+    // Timing, so a "it feels slow" report can be checked against numbers.
+    // rounds is the figure that actually drives wall-clock time.
+    const t2 = Date.now();
+    const rounds = Math.ceil(
+      Math.ceil(allIds.length / ORDERS_PER_BATCH) / CONCURRENT_BATCHES
+    );
+    console.log(
+      `[tracker] ${allIds.length} orders → ${lines.length} open lines · ` +
+        `ids ${t1 - t0}ms · detail ${t2 - t1}ms (${rounds} rounds) · ` +
+        `total ${t2 - t0}ms`
+    );
     return lines;
   } catch (error) {
     console.error("[tracker] fetchOrderLines error:", error);
