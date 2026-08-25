@@ -85,6 +85,31 @@ model TrackedItem {
   @@index([shop, status, stage])
 }
 
+// Cached copy of the outstanding order lines fetched from Shopify.
+//
+// The board needs the full two-phase sweep of every unfulfilled order to know
+// WHICH lines exist — about 35 seconds on a store with ~740 open orders, paid
+// on every page open, to discover something that changes a handful of times a
+// day. This table holds the result so only the first load pays.
+//
+// Deliberately caches ONLY the Shopify line list. Tracking status is never
+// cached — it is read live from TrackedItem on every board load — so a stage
+// change made on the workshop floor always shows immediately. The staleness
+// is confined to "an order placed in the last few minutes may not be listed
+// yet", which the board states plainly next to its Refresh button.
+//
+// One row per shop: the payload is the whole line array, so a refresh is a
+// single atomic replace rather than a diff.
+model OrderLineCache {
+  shop      String   @id
+  fetchedAt DateTime @default(now())
+  /// OrderLine[] as JSON — see app/utils/picklist.server.ts
+  payload   Json
+  /// How many lines the payload holds, so logs and the UI can report it
+  /// without deserialising the JSON.
+  lineCount Int      @default(0)
+}
+
 // Append-only movement log. Cheap to write, and what later answers
 // "this ring has been sitting in Setting for nine days".
 model TrackedItemEvent {

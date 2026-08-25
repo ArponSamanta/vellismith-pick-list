@@ -194,6 +194,19 @@ function ageLabel(iso: string | null): string | null {
 }
 
 /**
+ * "just now" / "6 min ago" / "2 h ago" — how current the cached order list is.
+ * Minute granularity, unlike ageLabel, which measures days in a stage.
+ */
+function freshnessLabel(iso: string): string {
+  const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60_000);
+  if (mins < 1) return "just now";
+  if (mins === 1) return "1 min ago";
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.round(mins / 60);
+  return hours === 1 ? "1 h ago" : `${hours} h ago`;
+}
+
+/**
  * Total pieces across a set of lines.
  *
  * A line's quantity can exceed 1, so the number of CARDS and the number of
@@ -239,7 +252,15 @@ export default function TrackPage() {
   const lines = useMemo(() => board.data?.lines ?? [], [board.data]);
   const error = board.data?.error ?? null;
   const loadingBoard = board.state === "loading" || board.data === undefined;
-  const refresh = useCallback(() => board.load(BOARD_ROUTE), [board]);
+
+  /**
+   * Refresh forces a real Shopify read (?force=1), bypassing the cache.
+   * The plain load used on mount is happy to be served from it.
+   */
+  const refresh = useCallback(
+    () => board.load(`${BOARD_ROUTE}?force=1`),
+    [board]
+  );
 
   const [search, setSearch] = useState("");
   const [mobileColumn, setMobileColumn] = useState<BoardColumn | "ALL">("ALL");
@@ -459,6 +480,22 @@ export default function TrackPage() {
               {/* Writes happen in the background; this just reassures, it
                   never blocks the board. */}
               {pendingWrites && <span className="tk-saving">Saving…</span>}
+              {/* State the data's age plainly. The cache means the order list
+                  can be a few minutes behind, and a board that quietly lies
+                  about how current it is would be worse than a slow one.
+                  (Tracking statuses are never cached — always live.) */}
+              {!loadingBoard && board.data?.fetchedAt && (
+                <span
+                  className="tk-freshness"
+                  title={
+                    board.data.cached
+                      ? "Order list served from cache. Refresh re-reads Shopify."
+                      : "Order list read from Shopify just now."
+                  }
+                >
+                  Orders {freshnessLabel(board.data.fetchedAt)}
+                </span>
+              )}
               <button
                 className="btn btn-secondary"
                 onClick={refresh}
@@ -852,6 +889,9 @@ const TRACK_CSS = `
 }
 .tk-app .btn:disabled { opacity: .55; cursor: default; }
 .tk-head-actions { display: flex; align-items: center; gap: 10px; flex: none; }
+.tk-freshness {
+  font-size: 11px; color: var(--color-neutral-600); white-space: nowrap;
+}
 .tk-saving {
   font-family: var(--font-heading); font-weight: 800; font-size: 11px;
   letter-spacing: .08em; text-transform: uppercase; color: var(--color-accent);

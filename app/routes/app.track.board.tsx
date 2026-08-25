@@ -29,13 +29,21 @@ export const shouldRevalidate: ShouldRevalidateFunction = () => false;
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
+
+  // ?force=1 comes from the board's Refresh button and bypasses the cache.
+  const force = new URL(request.url).searchParams.get("force") === "1";
+
   try {
-    const { lines } = await getBoard(admin, session.shop);
-    return { lines, error: null as string | null };
+    const { lines, fetchedAt, cached } = await getBoard(admin, session.shop, {
+      force,
+    });
+    return { lines, fetchedAt, cached, error: null as string | null };
   } catch (error) {
     console.error("[track] board loader error:", error);
     return {
       lines: [] as TrackedLine[],
+      fetchedAt: null as string | null,
+      cached: false,
       error: "Couldn't load orders from Shopify. Please try again.",
     };
   }

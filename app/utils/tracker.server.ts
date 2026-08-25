@@ -13,6 +13,8 @@
  *     It stays in the table as history rather than being deleted.
  */
 
+import type { Prisma } from "@prisma/client";
+
 import db from "../db.server";
 import { fetchOrderLines, type OrderLine } from "./picklist.server";
 import {
@@ -42,17 +44,127 @@ export interface TrackedLine extends OrderLine {
 export interface BoardData {
   lines: TrackedLine[];
   counts: Record<BoardColumn, number>;
+  /** When the underlying Shopify line list was last read. */
+  fetchedAt: string;
+  /** True if that list came from cache rather than a fresh sweep. */
+  cached: boolean;
 }
 
 /**
- * Everything the Track page renders: live order lines joined with stored
- * status, plus per-column totals.
+ * The outstanding order lines, from cache when it is fresh enough.
+ *
+ * Reading them from Shopify means the full two-phase sweep — ~35 seconds for
+ * ~740 open orders — which is far too slow to pay every time someone opens
+ * the board. It is also wasted work: the set of outstanding lines changes a
+ * few times a day, not a few times a minute.
+ *
+ * On a fetch failure with a cache present we deliberately serve the stale
+ * copy rather than an error. A board that is a few minutes behind is useful;
+ * an empty one is not, and the workshop's own statuses are unaffected either
+ * way since those are never cached.
+ */
+async function getOrderLines(
+  admin: AdminApiContext,
+  shop: string,
+  opts: { force?: boolean } = {}
+): Promise<{ lines: OrderLine[]; fetchedAt: string; cached: boolean }> {
+  const row = await db.orderLineCache.findUnique({ where: { shop } });
+  const age = row ? Date.now() - row.fetchedAt.getTime() : Infinity;
+
+  if (row && !opts.force && age < CACHE_TTL_MS) {
+    console.log(
+      `[tracker] cache hit · ${row.lineCount} lines · ${Math.round(age / 1000)}s old`
+    );
+    return {
+      lines: row.payload as unknown as OrderLine[],
+      fetchedAt: row.fetchedAt.toISOString(),
+      cached: true,
+    };
+  }
+
+  try {
+    const lines = await sweepOnce(admin, shop);
+    const fetchedAt = new Date();
+
+    await db.orderLineCache.upsert({
+      where: { shop },
+      create: {
+        shop,
+        fetchedAt,
+        lineCount: lines.length,
+        payload: lines as unknown as Prisma.InputJsonValue,
+      },
+      update: {
+        fetchedAt,
+        lineCount: lines.length,
+        payload: lines as unknown as Prisma.InputJsonValue,
+      },
+    });
+
+    return { lines, fetchedAt: fetchedAt.toISOString(), cached: false };
+  } catch (error) {
+    if (row) {
+      console.error(
+        "[tracker] refresh failed — serving stale cache instead:",
+        error
+      );
+      return {
+        lines: row.payload as unknown as OrderLine[],
+        fetchedAt: row.fetchedAt.toISOString(),
+        cached: true,
+      };
+    }
+    throw error; // nothing cached — the caller shows a real error
+  }
+}
+
+/**
+ * How long a cached line list is served before a load refreshes it.
+ *
+ * The trade is narrow: the cache decides only WHICH lines are listed, so
+ * being stale means "an order placed in the last few minutes isn't shown
+ * yet". Fifteen minutes keeps the board effectively instant all day while
+ * bounding that gap, and Refresh always forces a real read.
+ */
+const CACHE_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * Sweeps currently running, keyed by shop.
+ *
+ * Without this, two people opening the board on a cold cache each start their
+ * own 35-second sweep. That is not merely wasteful: both put batches in
+ * flight at once, blowing past Shopify's cost budget and throttling each
+ * other — the logs showed a pair of overlapping loads taking 57s instead of
+ * 35s. Callers that arrive mid-sweep now await the existing one.
+ *
+ * Process-local, which is sufficient here: Render runs a single instance.
+ */
+const inFlight = new Map<string, Promise<OrderLine[]>>();
+
+function sweepOnce(admin: AdminApiContext, shop: string): Promise<OrderLine[]> {
+  const existing = inFlight.get(shop);
+  if (existing) {
+    console.log("[tracker] joining the sweep already in progress");
+    return existing;
+  }
+
+  const run = fetchOrderLines(admin).finally(() => inFlight.delete(shop));
+  inFlight.set(shop, run);
+  return run;
+}
+
+/**
+ * Everything the Track page renders: order lines joined with stored status,
+ * plus per-column totals.
+ *
+ * `force` skips the cache — wired to the board's Refresh button.
  */
 export async function getBoard(
   admin: AdminApiContext,
-  shop: string
+  shop: string,
+  opts: { force?: boolean } = {}
 ): Promise<BoardData> {
-  const lines = await fetchOrderLines(admin);
+  const { lines, fetchedAt, cached } = await getOrderLines(admin, shop, opts);
 
   // One query for the whole board rather than per line.
   const tracked = await db.trackedItem.findMany({
@@ -85,7 +197,7 @@ export async function getBoard(
     };
   });
 
-  return { lines: joined, counts };
+  return { lines: joined, counts, fetchedAt, cached };
 }
 
 /**
