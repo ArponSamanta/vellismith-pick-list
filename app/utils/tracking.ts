@@ -63,17 +63,66 @@ export const COLUMN_LABELS: Record<BoardColumn, string> = {
 // ── Transitions ───────────────────────────────────────────────────────────
 
 // ── Promised date ─────────────────────────────────────────────────────────
-// Free text, exactly as typed — "15 Sep", "before Diwali", "end of month".
-// It's a note about when the customer wants the piece, not a machine-read
-// date, so nothing parses or validates it. The only rule is a length cap so a
-// stray paste can't bloat the row.
+// A real calendar date, so the board can be filtered to a range.
+//
+// Stored as a plain "YYYY-MM-DD" string rather than a DateTime, deliberately:
+// a date promised to a customer is a calendar DAY, not an instant. Held as a
+// UTC timestamp it would render as the previous day for a workshop at
+// UTC+5:30 — the same class of bug the order-date filter had to solve. The
+// string form also compares and sorts correctly with plain <, and is exactly
+// what <input type="date"> emits and expects.
+//
+// Free-form context ("before Diwali", "customer travelling") lives in the
+// separate `note` field, so neither has to do the other's job.
 
-export const PROMISED_DATE_MAX = 120;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-/** Trim and cap. Empty (or whitespace-only) means "no date recorded". */
+export function isPromisedDate(value: unknown): value is string {
+  return typeof value === "string" && DATE_RE.test(value);
+}
+
+/** Valid "YYYY-MM-DD" or null. Anything else is discarded, not guessed at. */
 export function cleanPromisedDate(value: unknown): string | null {
   if (typeof value !== "string") return null;
-  const trimmed = value.trim().slice(0, PROMISED_DATE_MAX);
+  const trimmed = value.trim();
+  return isPromisedDate(trimmed) ? trimmed : null;
+}
+
+/** "15 Sep" — compact enough for a card. */
+export function formatPromisedDate(value: string | null): string | null {
+  if (!isPromisedDate(value)) return null;
+  const [y, m, d] = value.split("-").map(Number);
+  // Built and read back in UTC so no local offset can shift the day.
+  return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString("en-GB", {
+    day: "2-digit",
+    month: "short",
+    timeZone: "UTC",
+  });
+}
+
+/**
+ * Is this date inside the (inclusive) range? Empty bounds mean "unbounded".
+ * ISO dates compare correctly as strings, so no parsing is involved.
+ */
+export function withinDateRange(
+  value: string | null,
+  from: string,
+  to: string
+): boolean {
+  if (!isPromisedDate(value)) return false; // no date can't match a range
+  if (from && value < from) return false;
+  if (to && value > to) return false;
+  return true;
+}
+
+// ── Note ──────────────────────────────────────────────────────────────────
+// Free text, exactly as typed. Capped only so a stray paste can't bloat a row.
+
+export const NOTE_MAX = 200;
+
+export function cleanNote(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim().slice(0, NOTE_MAX);
   return trimmed === "" ? null : trimmed;
 }
 

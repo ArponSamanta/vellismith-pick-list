@@ -18,6 +18,7 @@ import type { Prisma } from "@prisma/client";
 import db from "../db.server";
 import { fetchOrderLines, type OrderLine } from "./picklist.server";
 import {
+  cleanNote,
   cleanPromisedDate,
   columnFor,
   isStage,
@@ -305,19 +306,29 @@ export async function getStageMap(
 }
 
 /**
- * Set or clear the free-text date the customer asked for.
+ * Set or clear the promised date and/or the free-text note.
  *
- * Creates the row if needed with NO status, so a promised date can be
- * recorded at intake before anyone decides make-vs-ship. Deliberately writes
- * no movement event — the event log tracks production stages, not admin edits.
+ * Either field may be omitted to leave it untouched. Creates the row if
+ * needed with NO status, so both can be recorded at intake before anyone
+ * decides make-vs-ship. Deliberately writes no movement event — the event log
+ * tracks production stages, not admin edits.
  */
 export async function setPromisedDate(params: {
   shop: string;
   line: OrderLine;
-  promisedDate: string | null;
+  promisedDate?: string | null;
+  note?: string | null;
 }): Promise<void> {
   const { shop, line } = params;
-  const promisedDate = cleanPromisedDate(params.promisedDate);
+
+  const fields: { promisedDate?: string | null; note?: string | null } = {};
+  if (params.promisedDate !== undefined) {
+    fields.promisedDate = cleanPromisedDate(params.promisedDate);
+  }
+  if (params.note !== undefined) {
+    fields.note = cleanNote(params.note);
+  }
+  if (Object.keys(fields).length === 0) return; // nothing asked for
 
   await db.trackedItem.upsert({
     where: { shop_lineItemId: { shop, lineItemId: line.lineItemId } },
@@ -333,9 +344,11 @@ export async function setPromisedDate(params: {
       imageUrl: line.imageUrl,
       status: null, // still untriaged
       stage: null,
-      promisedDate,
+      promisedDate: fields.promisedDate ?? null,
+      note: fields.note ?? null,
     },
-    update: { promisedDate },
+    // Only the fields actually supplied, so setting a note never wipes a date.
+    update: fields,
   });
 }
 

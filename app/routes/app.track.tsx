@@ -30,8 +30,10 @@ import {
   STAGES,
   STAGE_LABELS,
   UNTRIAGED,
-  PROMISED_DATE_MAX,
+  NOTE_MAX,
   columnFor,
+  formatPromisedDate,
+  withinDateRange,
   isStage,
   isStatus,
   nextStep,
@@ -110,12 +112,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   };
 
   try {
-    if (intent === "promisedDate") {
-      // Free text — stored as typed. setPromisedDate trims and caps it.
+    if (intent === "details") {
+      // Only the fields actually present are touched, so saving a note can't
+      // clear the date and vice versa.
+      const rawDate = form.get("promisedDate");
+      const rawNote = form.get("note");
       await setPromisedDate({
         shop: session.shop,
         line,
-        promisedDate: String(form.get("promisedDate") ?? ""),
+        ...(rawDate !== null ? { promisedDate: String(rawDate) } : {}),
+        ...(rawNote !== null ? { note: String(rawNote) } : {}),
       });
       return { ok: true, error: null };
     }
@@ -263,6 +269,9 @@ export default function TrackPage() {
   );
 
   const [search, setSearch] = useState("");
+  // Promised-date range. Either bound may be empty, meaning unbounded.
+  const [dueFrom, setDueFrom] = useState("");
+  const [dueTo, setDueTo] = useState("");
   const [mobileColumn, setMobileColumn] = useState<BoardColumn | "ALL">("ALL");
   const [editing, setEditing] = useState<TrackedLine | null>(null);
 
@@ -273,7 +282,10 @@ export default function TrackPage() {
    * at which point the server is the truth again.
    */
   const [overrides, setOverrides] = useState<
-    Map<string, Partial<Pick<TrackedLine, "status" | "stage" | "promisedDate">>>
+    Map<
+      string,
+      Partial<Pick<TrackedLine, "status" | "stage" | "promisedDate" | "note">>
+    >
   >(new Map());
   const [saveError, setSaveError] = useState<string | null>(null);
 
@@ -343,6 +355,7 @@ export default function TrackPage() {
         stage,
         promisedDate:
           "promisedDate" in o ? o.promisedDate! : l.promisedDate,
+        note: "note" in o ? o.note! : l.note,
         column: columnFor(status, stage),
       };
     });
@@ -371,15 +384,25 @@ export default function TrackPage() {
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return effectiveLines;
-    return effectiveLines.filter(
-      (l) =>
+    const ranged = Boolean(dueFrom || dueTo);
+    if (!q && !ranged) return effectiveLines;
+
+    return effectiveLines.filter((l) => {
+      // A range excludes anything with no promised date — an undated piece
+      // isn't "due in this window", it has no due date at all.
+      if (ranged && !withinDateRange(l.promisedDate, dueFrom, dueTo)) {
+        return false;
+      }
+      if (!q) return true;
+      return (
         l.productTitle.toLowerCase().includes(q) ||
         l.variantTitle.toLowerCase().includes(q) ||
         l.orderName.toLowerCase().includes(q) ||
-        (l.sku ?? "").toLowerCase().includes(q)
-    );
-  }, [effectiveLines, search]);
+        (l.sku ?? "").toLowerCase().includes(q) ||
+        (l.note ?? "").toLowerCase().includes(q)
+      );
+    });
+  }, [effectiveLines, search, dueFrom, dueTo]);
 
   const byColumn = useMemo(() => {
     const map = new Map<BoardColumn, TrackedLine[]>();
@@ -443,21 +466,33 @@ export default function TrackPage() {
     if (back) move(line, back.status, back.stage);
   };
 
-  const savePromisedDate = (line: TrackedLine, value: string) => {
-    const trimmed = value.trim();
+  /** Save the promised date, the note, or both. Omitted fields are untouched. */
+  const saveDetails = (
+    line: TrackedLine,
+    patch: { promisedDate?: string; note?: string }
+  ) => {
     setSaveError(null);
     setOverrides((m) => {
       const next = new Map(m);
+      const cur = next.get(line.lineItemId) ?? {};
       next.set(line.lineItemId, {
-        ...(next.get(line.lineItemId) ?? {}),
-        promisedDate: trimmed === "" ? null : trimmed,
+        ...cur,
+        ...(patch.promisedDate !== undefined
+          ? { promisedDate: patch.promisedDate || null }
+          : {}),
+        ...(patch.note !== undefined
+          ? { note: patch.note.trim() || null }
+          : {}),
       });
       return next;
     });
     enqueue({
       ...snapshotOf(line),
-      intent: "promisedDate",
-      promisedDate: value,
+      intent: "details",
+      ...(patch.promisedDate !== undefined
+        ? { promisedDate: patch.promisedDate }
+        : {}),
+      ...(patch.note !== undefined ? { note: patch.note } : {}),
     });
   };
 
@@ -543,15 +578,57 @@ export default function TrackPage() {
             <b>lines/pieces</b>. The pick list totals <b>pieces</b>.
           </p>
 
-          {/* Search */}
+          {/* Search + promised-date range */}
           <div className="tk-toolbar">
             <input
-              className="input"
-              placeholder="Search product, variant, SKU or order…"
+              className="input tk-search"
+              placeholder="Search product, variant, SKU, order or note…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
+            <div className="tk-due-filter">
+              <label>
+                <span>Promised from</span>
+                <input
+                  className="input"
+                  type="date"
+                  value={dueFrom}
+                  max={dueTo || undefined}
+                  onChange={(e) => setDueFrom(e.target.value)}
+                />
+              </label>
+              <label>
+                <span>to</span>
+                <input
+                  className="input"
+                  type="date"
+                  value={dueTo}
+                  min={dueFrom || undefined}
+                  onChange={(e) => setDueTo(e.target.value)}
+                />
+              </label>
+              {(dueFrom || dueTo) && (
+                <button
+                  className="tk-clear-due"
+                  onClick={() => {
+                    setDueFrom("");
+                    setDueTo("");
+                  }}
+                >
+                  Clear
+                </button>
+              )}
+            </div>
           </div>
+
+          {/* An active range hides undated work entirely, which would
+              otherwise look like items had vanished. Say so. */}
+          {(dueFrom || dueTo) && (
+            <p className="tk-legend">
+              Showing only pieces with a promised date in range — undated
+              pieces are hidden.
+            </p>
+          )}
 
           {/* Mobile column chips */}
           <div className="tk-chips">
@@ -673,9 +750,13 @@ export default function TrackPage() {
                               {line.promisedDate && (
                                 <span
                                   className="tk-due"
-                                  title={`Wanted by ${line.promisedDate}`}
+                                  title={
+                                    `Promised ${line.promisedDate}` +
+                                    (line.note ? ` — ${line.note}` : "")
+                                  }
                                 >
-                                  {line.promisedDate}
+                                  {formatPromisedDate(line.promisedDate)}
+                                  {line.note ? " *" : ""}
                                 </span>
                               )}
                               {ageLabel(line.updatedAt) && (
@@ -782,15 +863,29 @@ export default function TrackPage() {
                   `key` re-seeds the field when a different item is opened. */}
               <p className="tk-group-label">Promised date</p>
               <input
-                key={editing.lineItemId}
+                key={`d-${editing.lineItemId}`}
+                className="input"
+                type="date"
+                defaultValue={editing.promisedDate ?? ""}
+                onChange={(e) =>
+                  saveDetails(editing, { promisedDate: e.target.value })
+                }
+              />
+
+              {/* Free-form context, so the date field can stay a real date and
+                  still capture "before Diwali, customer travelling". Saved on
+                  blur — per-keystroke would write on every letter typed. */}
+              <p className="tk-group-label">Note</p>
+              <input
+                key={`n-${editing.lineItemId}`}
                 className="input"
                 type="text"
-                placeholder="e.g. 15 Sep, before Diwali…"
-                maxLength={PROMISED_DATE_MAX}
-                defaultValue={editing.promisedDate ?? ""}
-                                onBlur={(e) => {
-                  if (e.target.value.trim() !== (editing.promisedDate ?? "")) {
-                    savePromisedDate(editing, e.target.value);
+                placeholder="e.g. before Diwali, customer travelling…"
+                maxLength={NOTE_MAX}
+                defaultValue={editing.note ?? ""}
+                onBlur={(e) => {
+                  if (e.target.value.trim() !== (editing.note ?? "")) {
+                    saveDetails(editing, { note: e.target.value });
                   }
                 }}
               />
@@ -929,7 +1024,22 @@ const TRACK_CSS = `
 }
 .tk-legend b { font-family: var(--font-heading); color: var(--color-text); }
 
-.tk-toolbar { padding: 18px 0; }
+.tk-toolbar {
+  padding: 18px 0; display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap;
+}
+.tk-search { flex: 1 1 280px; }
+.tk-due-filter { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+.tk-due-filter label { display: flex; flex-direction: column; gap: 4px; }
+.tk-due-filter label > span {
+  font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--color-neutral-600);
+}
+.tk-due-filter .input { width: auto; min-width: 150px; }
+.tk-clear-due {
+  font-family: var(--font-heading); font-weight: 800; font-size: 12px;
+  padding: 9px 12px; border: 1px solid var(--color-divider);
+  background: transparent; color: var(--color-accent); cursor: pointer;
+}
 .tk-app .input {
   width: 100%; min-height: 40px; padding: 8px 12px; font: inherit; font-size: 14px;
   color: var(--color-text); background: var(--color-surface);
@@ -1128,6 +1238,13 @@ const TRACK_CSS = `
   .tk-due { max-width: 45vw; }
   .tk-app .input { min-height: 44px; }
   .tk-next { width: 34px; height: 34px; }
+  /* Two date inputs side by side don't fit a phone — give each half a row. */
+  .tk-toolbar { gap: 10px; }
+  .tk-search { flex: 1 1 100%; }
+  .tk-due-filter { width: 100%; gap: 8px; }
+  .tk-due-filter label { flex: 1 1 0; min-width: 0; }
+  .tk-due-filter .input { width: 100%; min-width: 0; }
+  .tk-clear-due { min-height: 44px; flex: none; }
   /* Bigger triage targets for thumbs. */
   .tk-flag { padding: 8px 12px; font-size: 12px; }
 
