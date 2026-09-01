@@ -118,11 +118,20 @@ const ORDERS_PER_PAGE = 250;
  * and the measurements behind these numbers.
  */
 const ORDERS_PER_BATCH = 10;
-const FO_PER_ORDER = 2;  // fulfillmentOrders(first:) — Vellismith is single-location so 1 is typical
-const ITEMS_PER_FO = 10; // lineItems(first:) per FO — warnIfTruncated shouts if ever exceeded
+const FO_PER_ORDER = 2;  // covers ~96% of orders; the repair pass handles the rest
+const ITEMS_PER_FO = 20; // ditto
 
 /** Alias-batch requests to fire in parallel per round. */
 const CONCURRENT_BATCHES = 2;
+
+/**
+ * Generous limits for the second, targeted pass over orders the first pass
+ * truncated. Costly per order — 1 + 10 + 10 × 50 = 511 — which is precisely
+ * why it is only ever applied to the handful that need it, a few at a time.
+ */
+const REPAIR_FO_PER_ORDER = 10;
+const REPAIR_ITEMS_PER_FO = 50;
+const REPAIR_ORDERS_PER_BATCH = 1; // 511 points each; one at a time stays safe
 
 /**
  * Tuning phase 2, and the mistake worth not repeating.
@@ -660,19 +669,23 @@ async function fetchOrderIds(
  * size and GraphQL has no way to variable-ise a set of aliases. JSON.stringify
  * correctly escapes the Shopify GID strings.
  */
-function buildBatchQuery(orderIds: string[]): string {
+function buildBatchQuery(
+  orderIds: string[],
+  foPerOrder: number = FO_PER_ORDER,
+  itemsPerFo: number = ITEMS_PER_FO
+): string {
   const aliases = orderIds.map(
     (id, i) => `
   o${i}: order(id: ${JSON.stringify(id)}) {
     id
     name
     createdAt
-    fulfillmentOrders(first: ${FO_PER_ORDER}) {
+    fulfillmentOrders(first: ${foPerOrder}) {
       pageInfo { hasNextPage }
       edges {
         node {
           status
-          lineItems(first: ${ITEMS_PER_FO}) {
+          lineItems(first: ${itemsPerFo}) {
             pageInfo { hasNextPage }
             edges {
               node {
@@ -713,21 +726,12 @@ function buildBatchQuery(orderIds: string[]): string {
  * Deliberately loud (console.error) and never thrown — a truncated order is
  * still worth showing, it just must not pass unnoticed.
  */
-function warnIfTruncated(order: FetchedOrder): void {
-  if (order.fulfillmentOrders?.pageInfo?.hasNextPage) {
-    console.error(
-      `[picklist] TRUNCATED: order ${order.name} has more than ${FO_PER_ORDER} ` +
-        `fulfillment orders — raise FO_PER_ORDER. Items are being missed.`
-    );
-  }
+function isTruncated(order: FetchedOrder): boolean {
+  if (order.fulfillmentOrders?.pageInfo?.hasNextPage) return true;
   for (const { node: fo } of order.fulfillmentOrders?.edges ?? []) {
-    if (fo.lineItems?.pageInfo?.hasNextPage) {
-      console.error(
-        `[picklist] TRUNCATED: order ${order.name} has more than ${ITEMS_PER_FO} ` +
-          `line items on a fulfillment order — raise ITEMS_PER_FO. Items are being missed.`
-      );
-    }
+    if (fo.lineItems?.pageInfo?.hasNextPage) return true;
   }
+  return false;
 }
 
 /**
@@ -738,24 +742,39 @@ function warnIfTruncated(order: FetchedOrder): void {
  * those numbers were arrived at painfully (see the constants above) and must
  * not drift apart between callers.
  */
-async function streamOrders(
+/**
+ * Runs one pass of the alias-batched fetch, returning any orders Shopify had
+ * to truncate. Shared by the cheap main pass and the generous repair pass.
+ */
+async function runPass(
   admin: AdminApiContext,
   orderIds: string[],
-  visit: (order: FetchedOrder) => void
-): Promise<void> {
+  visit: (order: FetchedOrder) => void,
+  opts: {
+    ordersPerBatch: number;
+    foPerOrder: number;
+    itemsPerFo: number;
+    concurrent: number;
+  }
+): Promise<string[]> {
+  const truncated: string[] = [];
+
   // Split IDs into fixed-size alias batches.
   const batches: string[][] = [];
-  for (let i = 0; i < orderIds.length; i += ORDERS_PER_BATCH) {
-    batches.push(orderIds.slice(i, i + ORDERS_PER_BATCH));
+  for (let i = 0; i < orderIds.length; i += opts.ordersPerBatch) {
+    batches.push(orderIds.slice(i, i + opts.ordersPerBatch));
   }
 
-  // Fire CONCURRENT_BATCHES requests at a time.
-  for (let round = 0; round < batches.length; round += CONCURRENT_BATCHES) {
-    const concurrent = batches.slice(round, round + CONCURRENT_BATCHES);
+  // Fire `concurrent` requests at a time.
+  for (let round = 0; round < batches.length; round += opts.concurrent) {
+    const concurrent = batches.slice(round, round + opts.concurrent);
 
     const results = await Promise.allSettled(
       concurrent.map(async (batchIds) => {
-        const data: any = await graphqlWithRetry(admin, buildBatchQuery(batchIds));
+        const data: any = await graphqlWithRetry(
+          admin,
+          buildBatchQuery(batchIds, opts.foPerOrder, opts.itemsPerFo)
+        );
         return { data, count: batchIds.length };
       })
     );
@@ -778,11 +797,67 @@ async function streamOrders(
       for (let j = 0; j < count; j++) {
         const order = data.data?.[`o${j}`] as FetchedOrder | undefined;
         if (!order?.fulfillmentOrders?.edges) continue;
-        // Checked here, in the one place every consumer passes through.
-        warnIfTruncated(order);
+        if (isTruncated(order)) truncated.push(order.id);
         visit(order);
       }
     }
+  }
+
+  return truncated;
+}
+
+/**
+ * Fetches every order's fulfillment detail, in two passes.
+ *
+ * `first: N` truncates silently, so an order with more fulfillment orders or
+ * line items than we asked for was simply under-picked with no error. In
+ * production ~4% of orders (31 of 767) exceeded FO_PER_ORDER = 2 — typically
+ * ones fulfilled in several instalments, which accumulate fulfillment orders.
+ *
+ * Raising the limits for everyone is the wrong fix: cost per order is
+ * 1 + FO + FO × ITEMS, so FO = 10 costs 111 per order and a single 10-order
+ * batch would request more than the entire 1 000-point bucket — a tax on all
+ * 767 orders to serve the 31 that need it.
+ *
+ * So: cheap query for everyone, then re-fetch only the truncated orders with
+ * generous limits. Their second reading replaces the first, because `visit`
+ * is called again with the fuller data and the consumers de-duplicate by line
+ * item id — a line already counted is skipped, and the ones that were missing
+ * are added.
+ */
+async function streamOrders(
+  admin: AdminApiContext,
+  orderIds: string[],
+  visit: (order: FetchedOrder) => void
+): Promise<void> {
+  const truncated = await runPass(admin, orderIds, visit, {
+    ordersPerBatch: ORDERS_PER_BATCH,
+    foPerOrder: FO_PER_ORDER,
+    itemsPerFo: ITEMS_PER_FO,
+    concurrent: CONCURRENT_BATCHES,
+  });
+
+  if (truncated.length === 0) return;
+
+  console.warn(
+    `[picklist] ${truncated.length} order(s) exceeded the page limits — ` +
+      `re-fetching them with FO=${REPAIR_FO_PER_ORDER}, ITEMS=${REPAIR_ITEMS_PER_FO}`
+  );
+
+  const stillTruncated = await runPass(admin, truncated, visit, {
+    ordersPerBatch: REPAIR_ORDERS_PER_BATCH,
+    foPerOrder: REPAIR_FO_PER_ORDER,
+    itemsPerFo: REPAIR_ITEMS_PER_FO,
+    concurrent: CONCURRENT_BATCHES,
+  });
+
+  // If this fires, even the generous limits weren't enough and those orders
+  // ARE still being under-picked. Raise the REPAIR_* constants.
+  if (stillTruncated.length > 0) {
+    console.error(
+      `[picklist] STILL TRUNCATED after repair: ${stillTruncated.length} order(s) — ` +
+        `raise REPAIR_FO_PER_ORDER / REPAIR_ITEMS_PER_FO. Items are being missed.`
+    );
   }
 }
 
