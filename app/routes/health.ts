@@ -54,7 +54,32 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
   }
 
-  return json(body, 200);
+  // Humans and the deep probe get the JSON. Add ?verbose=1 to read it.
+  if (url.searchParams.get("verbose") === "1" || body.database !== undefined) {
+    return json(body, 200);
+  }
+
+  // The uptime pinger gets a 200 with NO BODY AT ALL.
+  //
+  // Render's CDN re-chunks every proxied response — verified against two edge
+  // nodes — stripping the Content-Length the origin sends. cron-job.org caps
+  // response size, has nothing to validate a chunked body against, and aborted
+  // this endpoint as "output too large" over 74 bytes. Nothing in application
+  // code can stop that re-chunking.
+  //
+  // But an empty body cannot be chunked: there is nothing to frame. This
+  // sidesteps the whole problem rather than fighting the CDN. The diagnostics
+  // move to headers, which are unaffected — so `curl -sI` still shows uptime,
+  // and ?verbose=1 still returns the full JSON when a human wants it.
+  return new Response(null, {
+    status: 200,
+    headers: {
+      "Content-Length": "0",
+      "X-Uptime-Seconds": String(body.uptimeSeconds),
+      "X-Health-Status": String(body.status),
+      "Cache-Control": "no-store, no-cache, must-revalidate, no-transform",
+    },
+  });
 };
 
 function json(body: unknown, status: number): Response {
