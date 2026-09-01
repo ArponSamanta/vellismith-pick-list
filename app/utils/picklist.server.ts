@@ -67,10 +67,12 @@ interface FetchedOrder {
   name: string;
   createdAt: string;
   fulfillmentOrders?: {
+    pageInfo?: { hasNextPage: boolean };
     edges: Array<{
       node: {
         status: string;
         lineItems?: {
+          pageInfo?: { hasNextPage: boolean };
           edges: Array<{
             node: {
               id: string;
@@ -112,55 +114,46 @@ const STORE_TZ_OFFSET_MINUTES = 330; // IST = UTC+5:30
 const ORDERS_PER_PAGE = 250;
 
 /**
- * Number of orders alias-batched into a single GraphQL request for the
- * fulfillment-order data pass. One batch's Shopify query cost:
- *   ORDERS_PER_BATCH × (1 + FO_PER_ORDER + FO_PER_ORDER × ITEMS_PER_FO)
- *   = 5 × (1 + 2 + 2 × 20) = 5 × 43 = 215 points.
- *
- * What actually matters for throttling is the *concurrent* cost, since the
- * leaky bucket (1 000 points, refilling ~50/sec on a standard store) is shared
- * across in-flight requests:
- *   CONCURRENT_BATCHES × 215 = 2 × 215 = 430  — comfortably under 1 000.
- *
- * The previous values (10/3/30 × 3 concurrent) demanded 3 × 940 = 2 820 points
- * at once against a 1 000 bucket, which is exactly why batches were throttled.
- * graphqlWithRetry now recovers from any residual throttle, but keeping the
- * steady-state demand under budget avoids the retries entirely.
- *
- * Reduce these further if Shopify still returns THROTTLED / query-cost errors;
- * raise ITEMS_PER_FO / FO_PER_ORDER only if orders start truncating.
+ * Phase-2 batching. See the tuning note below the constants for the reasoning
+ * and the measurements behind these numbers.
  */
 const ORDERS_PER_BATCH = 10;
 const FO_PER_ORDER = 2;  // fulfillmentOrders(first:) — Vellismith is single-location so 1 is typical
-const ITEMS_PER_FO = 20; // lineItems(first:) per FO — plenty for jewelry orders (typically 1-10)
+const ITEMS_PER_FO = 10; // lineItems(first:) per FO — warnIfTruncated shouts if ever exceeded
 
 /** Alias-batch requests to fire in parallel per round. */
 const CONCURRENT_BATCHES = 2;
 
 /**
- * Why 10 × 2 rather than the earlier 5 × 2.
+ * Tuning phase 2, and the mistake worth not repeating.
  *
- * The wall-clock cost of phase 2 is dominated by the NUMBER OF ROUND TRIPS,
- * not by throttling: one round trip covered 10 orders (5 per batch × 2 in
- * parallel), so several hundred unfulfilled orders meant 40+ sequential
- * requests at a few hundred ms each — the reason the tracker took so long to
- * appear on a busy store.
+ * Two things drive wall-clock time: the NUMBER of round trips, and how long
+ * each waits to be admitted. An earlier change optimised the first and
+ * ignored the second — ORDERS_PER_BATCH went 5 → 10 on the reasoning that
+ * "2 × 430 = 860 is under the 1 000-point bucket, so it cannot throttle".
  *
- * Meanwhile the rate-limit budget was barely touched. Shopify checks the
- * REQUESTED cost against a 1 000-point bucket before running a query:
- *   per batch      = ORDERS_PER_BATCH × (1 + FO_PER_ORDER + FO_PER_ORDER × ITEMS_PER_FO)
- *                  = 10 × (1 + 2 + 2 × 20) = 10 × 43 = 430
- *   in flight      = CONCURRENT_BATCHES × 430 = 860   — still under 1 000
- * Doubling the batch halves the round trips for the same concurrency.
+ * Production logs disproved it: ~10 `throttled, retry 1/6` per run, and the
+ * backoff accounted for roughly 22 of 35 seconds. Shopify admits a query
+ * against the points CURRENTLY AVAILABLE, not the bucket's full size, and
+ * after a few rounds the bucket is drained — the refill is ~50/sec. A larger
+ * request is therefore harder to admit, and every rejection costs a wait
+ * proportional to the deficit.
  *
- * Note the bucket is refunded the difference between requested and ACTUAL
- * cost, and a typical jewelry order has one fulfillment order with a couple
- * of line items — actual cost per batch is a small fraction of 430 — so
- * sustained throughput was never the constraint either.
+ * So the lever that matters is the requested cost per query:
+ *   per order = 1 + FO_PER_ORDER + FO_PER_ORDER × ITEMS_PER_FO
+ *   before    = 1 + 2 + 2 × 20 = 43   → batch 430, in flight 860
+ *   now       = 1 + 2 + 2 × 10 = 23   → batch 230, in flight 460
+ * Nearly half, so batches are admitted instead of bouncing, while the round
+ * trip count stays the same.
  *
- * Do not raise CONCURRENT_BATCHES to 3 without lowering ORDERS_PER_BATCH:
- * 3 × 430 = 1 290 exceeds the bucket and is exactly the shape of the
- * throttling bug that once silently dropped orders.
+ * Halving ITEMS_PER_FO was previously refused because `first: N` truncates
+ * silently and would under-pick a large order with no error. warnIfTruncated
+ * removes that objection: it now logs loudly if any order exceeds either page
+ * size, which makes these constants a knob rather than a gamble. If those
+ * lines appear, raise the constant — do not ignore them.
+ *
+ * Do not raise CONCURRENT_BATCHES without recomputing the in-flight figure,
+ * and change one variable at a time — measuring is the whole point.
  */
 
 // ─── Exported API ─────────────────────────────────────────────────────────────
@@ -169,6 +162,8 @@ export async function generatePickList(
   admin: AdminApiContext,
   options?: PickListOptions
 ): Promise<PickListProduct[]> {
+  const t0 = Date.now();
+  const throttlesAtStart = throttleCount;
   try {
     // Phase 1 — lightweight ID fetch for both order statuses concurrently.
     // "unfulfilled" = nothing fulfilled yet; "partial" = some done, some pending.
@@ -195,8 +190,21 @@ export async function generatePickList(
     if (allIds.length === 0) return [];
 
     // Phase 2 — fetch fulfillment order data (remainingQuantity) in alias batches.
+    const t1 = Date.now();
     const pickList = await fetchFulfillmentData(admin, allIds);
-    console.log(`[picklist] phase 2 — ${pickList.length} products to pick`);
+    const t2 = Date.now();
+
+    // Same shape as the tracker line, so the two are comparable. throttles is
+    // the number to watch when tuning the batch constants: backoff waits, not
+    // request count, were what actually dominated the wall clock.
+    const rounds = Math.ceil(
+      Math.ceil(allIds.length / ORDERS_PER_BATCH) / CONCURRENT_BATCHES
+    );
+    console.log(
+      `[picklist] ${allIds.length} orders → ${pickList.length} products · ` +
+        `ids ${t1 - t0}ms · detail ${t2 - t1}ms (${rounds} rounds, ` +
+        `${throttleCount - throttlesAtStart} throttles) · total ${t2 - t0}ms`
+    );
 
     return sortPickList(pickList, options?.sortBy ?? "alpha");
   } catch (error) {
@@ -241,6 +249,7 @@ export async function fetchOrderLines(
   options?: DateRangeOptions
 ): Promise<OrderLine[]> {
   const t0 = Date.now();
+  const throttlesAtStart = throttleCount;
   try {
     const [unfulfilledIds, partialIds] = await Promise.all([
       fetchOrderIds(admin, "unfulfilled", options),
@@ -296,7 +305,8 @@ export async function fetchOrderLines(
     );
     console.log(
       `[tracker] ${allIds.length} orders → ${lines.length} open lines · ` +
-        `ids ${t1 - t0}ms · detail ${t2 - t1}ms (${rounds} rounds) · ` +
+        `ids ${t1 - t0}ms · detail ${t2 - t1}ms (${rounds} rounds, ` +
+        `${throttleCount - throttlesAtStart} throttles) · ` +
         `total ${t2 - t0}ms`
     );
     return lines;
@@ -496,6 +506,17 @@ const MAX_THROTTLE_RETRIES = 6;
  * silently skipped, so its orders never reached the pick list — producing an
  * incomplete list that looked like a broken date filter.
  */
+/**
+ * Monotonic count of throttle events for the life of the process.
+ *
+ * Runs report the DELTA across their own span rather than resetting this,
+ * because two overlapping sweeps sharing one module-level counter would
+ * otherwise zero each other's baseline and report nonsense. A delta can still
+ * over-count when runs overlap — it cannot go negative or silently lose a
+ * run's events, which is the property that matters for a diagnostic.
+ */
+let throttleCount = 0;
+
 async function graphqlWithRetry(
   admin: AdminApiContext,
   query: string,
@@ -514,6 +535,14 @@ async function graphqlWithRetry(
         data.errors.some((e: any) => e?.extensions?.code === "THROTTLED");
 
       if (throttled && attempt < MAX_THROTTLE_RETRIES) {
+        // Counted and logged like the thrown path. This branch was previously
+        // silent, so throttling that arrived as a THROTTLED error in the
+        // response body — the common form, and the one carrying real cost data
+        // — never appeared in the logs or the totals.
+        throttleCount++;
+        console.warn(
+          `[picklist] throttled (response), retry ${attempt + 1}/${MAX_THROTTLE_RETRIES}`
+        );
         await sleep(throttleWaitMs(data, attempt));
         continue;
       }
@@ -524,6 +553,7 @@ async function graphqlWithRetry(
         console.warn(
           `[picklist] throttled (thrown), retry ${attempt + 1}/${MAX_THROTTLE_RETRIES}`
         );
+        throttleCount++;
         await sleep(throttleWaitMs(null, attempt));
         continue;
       }
@@ -638,10 +668,12 @@ function buildBatchQuery(orderIds: string[]): string {
     name
     createdAt
     fulfillmentOrders(first: ${FO_PER_ORDER}) {
+      pageInfo { hasNextPage }
       edges {
         node {
           status
           lineItems(first: ${ITEMS_PER_FO}) {
+            pageInfo { hasNextPage }
             edges {
               node {
                 id
@@ -667,6 +699,35 @@ function buildBatchQuery(orderIds: string[]): string {
   );
 
   return `query BatchFulfillmentOrders {\n${aliases.join("\n")}\n}`;
+}
+
+/**
+ * Shouts if Shopify had more to give than we asked for.
+ *
+ * `first: N` silently returns the first N and drops the rest — so an order
+ * with more line items than ITEMS_PER_FO would be UNDER-PICKED with no error
+ * anywhere. Nothing detected that until now, which is what made lowering the
+ * page size unsafe. With this guard the page size becomes a tuning knob
+ * instead of a gamble: if these lines ever appear, raise the constant.
+ *
+ * Deliberately loud (console.error) and never thrown — a truncated order is
+ * still worth showing, it just must not pass unnoticed.
+ */
+function warnIfTruncated(order: FetchedOrder): void {
+  if (order.fulfillmentOrders?.pageInfo?.hasNextPage) {
+    console.error(
+      `[picklist] TRUNCATED: order ${order.name} has more than ${FO_PER_ORDER} ` +
+        `fulfillment orders — raise FO_PER_ORDER. Items are being missed.`
+    );
+  }
+  for (const { node: fo } of order.fulfillmentOrders?.edges ?? []) {
+    if (fo.lineItems?.pageInfo?.hasNextPage) {
+      console.error(
+        `[picklist] TRUNCATED: order ${order.name} has more than ${ITEMS_PER_FO} ` +
+          `line items on a fulfillment order — raise ITEMS_PER_FO. Items are being missed.`
+      );
+    }
+  }
 }
 
 /**
@@ -717,6 +778,8 @@ async function streamOrders(
       for (let j = 0; j < count; j++) {
         const order = data.data?.[`o${j}`] as FetchedOrder | undefined;
         if (!order?.fulfillmentOrders?.edges) continue;
+        // Checked here, in the one place every consumer passes through.
+        warnIfTruncated(order);
         visit(order);
       }
     }

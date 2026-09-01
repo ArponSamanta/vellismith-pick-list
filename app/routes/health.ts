@@ -58,10 +58,20 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 function json(body: unknown, status: number): Response {
-  return new Response(JSON.stringify(body), {
+  const payload = JSON.stringify(body);
+
+  return new Response(payload, {
     status,
     headers: {
       "Content-Type": "application/json",
+      // Declare the length explicitly.
+      //
+      // Without it Node streams the response with Transfer-Encoding: chunked
+      // and no declared size. Uptime checkers that enforce a maximum response
+      // size have nothing to validate against and abort — cron-job.org failed
+      // this endpoint with "output too large" while the body was 75 bytes.
+      // A fixed, tiny payload has no reason to be chunked.
+      "Content-Length": String(Buffer.byteLength(payload, "utf8")),
       // Never let a proxy or CDN answer the pinger from cache: a cached 200
       // would report "up" for a service that is actually down.
       "Cache-Control": "no-store, no-cache, must-revalidate",
