@@ -66,15 +66,23 @@ function json(body: unknown, status: number): Response {
       "Content-Type": "application/json",
       // Declare the length explicitly.
       //
-      // Without it Node streams the response with Transfer-Encoding: chunked
+      // Without it the response is streamed with Transfer-Encoding: chunked
       // and no declared size. Uptime checkers that enforce a maximum response
       // size have nothing to validate against and abort — cron-job.org failed
       // this endpoint with "output too large" while the body was 75 bytes.
-      // A fixed, tiny payload has no reason to be chunked.
       "Content-Length": String(Buffer.byteLength(payload, "utf8")),
-      // Never let a proxy or CDN answer the pinger from cache: a cached 200
-      // would report "up" for a service that is actually down.
-      "Cache-Control": "no-store, no-cache, must-revalidate",
+      // no-store/no-cache: never let a proxy answer the pinger from cache, or
+      // a cached 200 would report "up" for a service that is down.
+      //
+      // no-transform is what actually preserves Content-Length above.
+      // react-router-serve wraps every response in the `compression`
+      // middleware, which drops Content-Length and re-chunks anything it may
+      // compress — so setting the header alone did nothing, and the endpoint
+      // stayed chunked after the first fix. `compression` explicitly skips
+      // responses marked no-transform (RFC 7234 §5.2.2.4), which is the only
+      // route-level way to opt out without ejecting from react-router-serve.
+      // Compressing 75 bytes is pointless anyway; gzip made it *larger* (89).
+      "Cache-Control": "no-store, no-cache, must-revalidate, no-transform",
     },
   });
 }
