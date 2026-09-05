@@ -4,4 +4,8 @@ webhooks_path = "/webhooks/app/uninstalled"
 
 [commands]
 predev = "npx prisma generate"
-dev = "npx prisma migrate deploy && npm exec react-router dev"
+# Retrying wrapper rather than a bare `prisma migrate deploy`: Neon suspends the
+# compute when idle, and a cold start can outlast Prisma's fixed 10-second
+# advisory-lock timeout, killing `shopify app dev` with P1002 before the server
+# ever starts. See scripts/migrate.mjs.
+dev = "node scripts/migrate.mjs && npm exec react-router dev"

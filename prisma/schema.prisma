@@ -110,6 +110,218 @@ model OrderLineCache {
   lineCount Int      @default(0)
 }
 
+// ─── Manufacturing batches ─────────────────────────────────────────────────
+// A batch is one production RUN through the workshop — a casting tree carries
+// rings, pendants and studs together and they are cast, filed, set and
+// polished as one job. The run, not the individual piece, is what the workshop
+// manages, which is why the stage lives on Batch.
+//
+// ── Why a run is per PRODUCT, not per variant ─────────────────────────────
+// A gold-plated ring and a silver one are THE SAME PHYSICAL OBJECT until the
+// last step. Same casting, same filing, same setting, same polishing. They
+// only become different products when some of them are plated.
+//
+// So a run makes a number of RAW pieces of a product, carrying no finish at
+// all. At the plating stage somebody decides how many to plate; those become
+// the plated variant and the rest are finished as they are. Committing to
+// "12 gold, 8 silver" back at casting time would be guessing at a decision
+// that doesn't have to be made until the pieces are polished and the week's
+// orders are in.
+//
+//   BatchProduct   Aurora Ring · 20 raw · splits at PLATING
+//     ├─ BatchItem    order lines for ANY finish — these set the minimums
+//     ├─ BatchScrap   losses; a piece that breaks at Casting has no finish
+//     └─ BatchFinish  Silver ×20   ──split──▶   Silver ×8 · Gold-plated ×12
+//
+// Unlike TrackedItem, a Batch is NOT derived from Shopify — it is a decision
+// somebody made, so it has to survive on its own.
+
+model Batch {
+  id   String @id @default(cuid())
+  shop String
+
+  /// What the workshop calls this run — "Casting 14 Sep", "Diwali restock".
+  name String
+
+  /// OPEN → MADE → CLOSED, or CANCELLED. MADE means every piece exists and
+  /// the stock write is now offered; CLOSED means the run is archived.
+  status String @default("OPEN")
+
+  /// Where the whole run sits in the workshop — same vocabulary as
+  /// TrackedItem.stage (see app/utils/tracking.ts). Advancing the batch
+  /// writes this stage onto every member order line, which is the point: a
+  /// tree of thirty pieces goes through casting together, not card by card.
+  stage String?
+
+  note String?
+
+  // Inventory write receipt for the run as a whole. One Shopify adjustment
+  // covers every finish in the batch, so the timestamp and location live here
+  // and the per-finish deltas live on BatchFinish.
+  //
+  // Claimed BEFORE the Shopify call and released if it fails, so a double-tap
+  // or a retried request can never add the same stock twice.
+  inventorySyncedAt   DateTime?
+  inventoryLocationId String?
+  inventoryLocation   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  products BatchProduct[]
+
+  @@index([shop, status])
+}
+
+/// One product being made in a run, as raw pieces with no finish yet.
+model BatchProduct {
+  id      String @id @default(cuid())
+  batchId String
+  batch   Batch  @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  productId    String
+  productTitle String
+  imageUrl     String?
+
+  /// Raw pieces the run makes of this product. This is the casting number,
+  /// and it is deliberately NOT split by finish — see the header.
+  ///
+  /// It is the INTENDED count. What survives is this minus the scrap below,
+  /// and only survivors may be allocated to a finish or written to stock.
+  plannedQuantity Int
+
+  /// The stage at which finishes are decided, from the tracking.ts
+  /// vocabulary. Null means this product has no split at all — a single
+  /// finish carries the whole quantity from start to finish.
+  splitStage String? @default("PLATING")
+
+  /// When somebody actually made the split. Null means the allocation is
+  /// still the single finish it started with.
+  splitDecidedAt DateTime?
+
+  items    BatchItem[]
+  finishes BatchFinish[]
+  scraps   BatchScrap[]
+
+  @@unique([batchId, productId])
+  // Serves "which live run, if any, is already making this product".
+  @@index([productId])
+}
+
+/// How a product's pieces are allocated across finishes.
+///
+/// One row exists from the moment the run is created, holding the whole
+/// quantity as the product's default (unplated) variant — so a product that
+/// never splits needs no further decision. The plating handler moves quantity
+/// between rows; the total across them always equals the surviving pieces.
+model BatchFinish {
+  id             String       @id @default(cuid())
+  batchProductId String
+  batchProduct   BatchProduct @relation(fields: [batchProductId], references: [id], onDelete: Cascade)
+
+  variantId    String
+  variantTitle String
+  sku          String?
+
+  /// Pieces that will carry this finish.
+  quantity Int
+
+  /// Pieces actually added to Shopify's on-hand count for this variant. Null
+  /// until the stock write succeeds, and it stays null for a finish that was
+  /// skipped — untracked, or not stocked at the chosen location — while the
+  /// rest of the run was written.
+  inventoryDelta Int?
+
+  @@unique([batchProductId, variantId])
+  @@index([variantId])
+}
+
+// Pieces lost in production — a cracked stone at Setting, a failed casting.
+//
+// Append-only, one row per incident. The count alone answers "how many
+// survived"; the log also answers "where do we keep losing pieces", which is
+// the question worth being able to ask after a few months.
+//
+// Attached to the PRODUCT, not a finish: a piece that cracks during casting
+// is a raw piece, and forcing somebody to say whether it was going to be gold
+// or silver would be inventing a fact. A loss after the split can name its
+// finish through the optional variantId.
+model BatchScrap {
+  id             String       @id @default(cuid())
+  batchProductId String
+  batchProduct   BatchProduct @relation(fields: [batchProductId], references: [id], onDelete: Cascade)
+
+  /// Set only for a loss after finishes were decided.
+  variantId String?
+
+  /// Pieces lost. Always positive; a mistaken entry is corrected by deleting
+  /// the row, so the log never has to be read as a running signed total.
+  quantity Int
+
+  /// Where it happened, from the tracking.ts vocabulary. Null when the run
+  /// hadn't started a stage yet, or nobody recorded which.
+  stage String?
+  note  String?
+
+  createdAt DateTime @default(now())
+
+  @@index([batchProductId])
+}
+
+// One outstanding order line the run covers.
+//
+// Attached to the product rather than a finish, because the run covers the
+// product — but it keeps its own variantId, which is what sets the MINIMUM
+// for each finish when the split is made: you cannot allocate fewer plated
+// pieces than there are plated pieces on order.
+//
+// quantity is a snapshot of what was owed when the line was added. It is NOT
+// what the batch's arithmetic runs on — committed is always recomputed from
+// the live outstanding lines, so a cancelled or edited order is reflected
+// honestly. The snapshot exists so a CLOSED batch still reads correctly in
+// history, long after its lines have vanished from Shopify.
+model BatchItem {
+  id             String       @id @default(cuid())
+  batchProductId String
+  batchProduct   BatchProduct @relation(fields: [batchProductId], references: [id], onDelete: Cascade)
+
+  lineItemId String // gid://shopify/LineItem/… — joins back to the order
+  orderId    String
+  orderName  String
+  /// The finish this particular order actually wants.
+  variantId  String
+  quantity   Int
+
+  createdAt DateTime @default(now())
+
+  @@unique([batchProductId, lineItemId])
+  // Answers "is this line already spoken for?" when listing candidates.
+  @@index([lineItemId])
+}
+
+/// A variant's remembered path through the workshop.
+///
+/// "Silver never needs plating" is permanently true — a property of the
+/// variant, not of this Tuesday's casting. Storing it once means the plating
+/// handler knows, without being told again, which finishes still have a stage
+/// to go and which are finished the moment they are allocated.
+model VariantRoute {
+  id        String @id @default(cuid())
+  shop      String
+  productId String
+  variantId String
+
+  /// Stages this variant does not pass through, from tracking.ts. Stored as
+  /// exclusions rather than the required list so that adding a stage to the
+  /// workshop later applies to existing variants instead of bypassing them.
+  skipStages String[] @default([])
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([shop, variantId])
+  @@index([shop, productId])
+}
+
 // Append-only movement log. Cheap to write, and what later answers
 // "this ring has been sitting in Setting for nine days".
 model TrackedItemEvent {

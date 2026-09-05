@@ -32,6 +32,7 @@ export default function App() {
           Home
         </s-link>
         <s-link href="/app/track">Track</s-link>
+        <s-link href="/app/batch">Batches</s-link>
         <s-link href="/app/credit">Credit</s-link>
       </s-app-nav>
       <Outlet />

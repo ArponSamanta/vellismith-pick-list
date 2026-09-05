@@ -25,10 +25,8 @@ import {
 // Static for the same reason as above — never switch this to await import().
 import { getStageMap } from "../utils/tracker.server";
 import {
+  BOARD_COLUMNS,
   COLUMN_LABELS,
-  STAGES,
-  STAGE_LABELS,
-  UNTRIAGED,
   columnFor,
   isStage,
   isStatus,
@@ -345,7 +343,12 @@ export default function Index() {
   const [selectedVariants, setSelectedVariants] = useState<string[]>([]);
   // Production-stage narrowing, e.g. "just what's waiting to be cast".
   // "ALL" = no stage filter (the default).
-  const [stageFilter, setStageFilter] = useState<BoardColumn | "ALL">("ALL");
+  /**
+   * Stages to include. Empty means all of them — a pick list for "Casting and
+   * Setting" is an ordinary request, and forcing one stage at a time made you
+   * print twice and staple.
+   */
+  const [stageFilter, setStageFilter] = useState<Set<BoardColumn>>(new Set());
   const [variantMenuOpen, setVariantMenuOpen] = useState(false);
   // Free-text filter for the (potentially long) variant dropdown. Default is
   // empty = show every variant; typing narrows the list client-side.
@@ -382,18 +385,24 @@ export default function Index() {
    * quantity, its order numbers, and the product total.
    */
   const stageFiltered: any[] = useMemo(() => {
-    if (stageFilter === "ALL") return rawPickList;
+    // An empty selection means "every stage" — the same as ticking them all,
+    // and the state nobody has to think about.
+    if (stageFilter.size === 0) return rawPickList;
 
     return rawPickList
       .map((p: any) => {
         const variants = p.variants
           .map((v: any) => {
-            const lines = (v.lines ?? []).filter(
-              (l: any) =>
+            // Typed to just the two fields this reads, rather than the `any`
+            // the rest of this pipeline uses: both go through isStatus/isStage,
+            // which take unknown, so nothing is being asserted here.
+            const lines = (v.lines ?? []).filter((l: { status?: unknown; stage?: unknown }) =>
+              stageFilter.has(
                 columnFor(
                   isStatus(l.status) ? l.status : null,
                   isStage(l.stage) ? l.stage : null
-                ) === stageFilter
+                )
+              )
             );
             if (lines.length === 0) return null;
             return {
@@ -554,8 +563,16 @@ export default function Index() {
     month: "short",
     year: "numeric",
   });
+  // Named in full up to three, then counted — a header listing eight stages
+  // is just the word "all" spelled out at length.
   const stageLabel =
-    stageFilter === "ALL" ? "All stages" : COLUMN_LABELS[stageFilter];
+    stageFilter.size === 0
+      ? "All stages"
+      : stageFilter.size <= 3
+        ? BOARD_COLUMNS.filter((c) => stageFilter.has(c))
+            .map((c) => COLUMN_LABELS[c])
+            .join(", ")
+        : `${stageFilter.size} stages`;
 
   const variantLabel =
     selectedVariants.length === 0
@@ -788,6 +805,28 @@ export default function Index() {
           display: block; font-size: 12px; margin-bottom: 5px;
           color: color-mix(in srgb, var(--color-text) 70%, transparent);
         }
+        /* Stage filter — multi-select, so every option stays on screen and
+           the current selection needs no reading back from a closed box. */
+        .pk-app .stage-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+        .pk-app .stage-chip {
+          font-family: var(--font-heading); font-weight: 800; font-size: 11px;
+          letter-spacing: .04em; padding: 6px 10px; cursor: pointer;
+          border: 1px solid var(--color-divider); background: transparent;
+          color: var(--color-text);
+        }
+        .pk-app .stage-chip:hover {
+          border-color: color-mix(in srgb, var(--color-text) 45%, transparent);
+        }
+        .pk-app .stage-chip.on {
+          background: var(--color-text); border-color: var(--color-text);
+          color: var(--color-bg);
+        }
+        .pk-app .stage-clear {
+          float: right; font-family: var(--font-heading); font-weight: 800;
+          font-size: 11px; padding: 0; border: none; background: transparent;
+          color: var(--color-accent); cursor: pointer;
+        }
+
         .pk-app .input {
           width: 100%; min-height: 36px; padding: 6px 10px; font: inherit;
           font-size: 14px; color: var(--color-text); caret-color: var(--color-accent);
@@ -958,12 +997,12 @@ export default function Index() {
             Unfulfilled orders · {today}
             {/* A stage-filtered sheet is a PARTIAL list. Say so on the paper —
                 otherwise the bench has no way to tell it isn't everything. */}
-            {stageFilter !== "ALL" && ` · ${stageLabel}`}
+            {stageFilter.size > 0 && ` · ${stageLabel}`}
           </div>
           <div className="ph-title">Pick List</div>
           <div className="ph-meta">
             {printMode === "manufacturing" ? "Manufacturing list" : "Tracking list"}
-            {stageFilter !== "ALL" && (
+            {stageFilter.size > 0 && (
               <>
                 &nbsp;·&nbsp; Stage: <b>{stageLabel}</b>
               </>
@@ -1186,7 +1225,7 @@ export default function Index() {
                 </span>
               </button>
               <span style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-                {stageFilter !== "ALL" && (
+                {stageFilter.size > 0 && (
                   <span className="tag tag-accent">{stageLabel}</span>
                 )}
                 {selectedVariants.length > 0 && (
@@ -1420,32 +1459,58 @@ export default function Index() {
                     )}
                   </div>
 
-                  {/* Production stage — narrows the list to one bench's work,
-                      e.g. print just what's waiting to be cast. */}
-                  <div className="field" style={{ flex: "1 1 160px" }}>
-                    <label>Stage</label>
-                    <select
-                      className="input"
-                      value={stageFilter}
-                      onChange={(e) =>
-                        setStageFilter(e.target.value as BoardColumn | "ALL")
-                      }
-                      style={{
-                        fontFamily: "var(--font-heading)",
-                        fontWeight: 800,
-                        fontSize: "13px",
-                        cursor: "pointer",
-                      }}
-                    >
-                      <option value="ALL">All stages</option>
-                      <option value={UNTRIAGED}>Untriaged</option>
-                      {STAGES.map((s) => (
-                        <option key={s} value={s}>
-                          {STAGE_LABELS[s]}
-                        </option>
-                      ))}
-                      <option value="READY_TO_SHIP">Ready to ship</option>
-                    </select>
+                  {/* Production stages — narrows the list to particular
+                      benches' work. Multi-select, because "everything waiting
+                      to be cast or set" is one sheet, not two.
+
+                      Chips rather than a multi-select box: there are only
+                      eight, the labels are short, and every one stays visible
+                      so the current selection needs no reading back. */}
+                  <div className="field" style={{ flex: "1 1 100%" }}>
+                    <label>
+                      Stages
+                      {stageFilter.size > 0 && (
+                        <button
+                          type="button"
+                          className="stage-clear"
+                          onClick={() => setStageFilter(new Set())}
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </label>
+                    <div className="stage-chips">
+                      <button
+                        type="button"
+                        className={
+                          stageFilter.size === 0 ? "stage-chip on" : "stage-chip"
+                        }
+                        onClick={() => setStageFilter(new Set())}
+                      >
+                        All stages
+                      </button>
+                      {BOARD_COLUMNS.map((col) => {
+                        const on = stageFilter.has(col);
+                        return (
+                          <button
+                            key={col}
+                            type="button"
+                            className={on ? "stage-chip on" : "stage-chip"}
+                            aria-pressed={on}
+                            onClick={() =>
+                              setStageFilter((current) => {
+                                const next = new Set(current);
+                                if (next.has(col)) next.delete(col);
+                                else next.add(col);
+                                return next;
+                              })
+                            }
+                          >
+                            {COLUMN_LABELS[col]}
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
 
                   <div className="field" style={{ flex: "1 1 170px" }}>

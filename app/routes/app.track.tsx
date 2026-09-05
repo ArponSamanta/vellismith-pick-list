@@ -200,6 +200,53 @@ function ageLabel(iso: string | null): string | null {
 }
 
 /**
+ * When this piece was last touched — null if nobody ever has.
+ *
+ * Strictly the tracking row's own timestamp. An earlier version fell back to
+ * the order date for untriaged pieces, which put a second unlabelled date on
+ * the card right beside the promised one; two bare dates next to each other
+ * are worse than one date and a blank.
+ */
+function updatedDate(line: TrackedLine): string | null {
+  return line.updatedAt;
+}
+
+/**
+ * The key a column is ordered by: oldest work first.
+ *
+ * Untriaged sorts by the ORDER date, never by updatedAt. A piece can pick up a
+ * recent timestamp without any progress being made — setting a promised date
+ * writes the row, and so does cancelling a run, which releases its lines back
+ * to untriaged. Sorting on that put the oldest order at the bottom, because it
+ * happened to be the one touched most recently.
+ *
+ * In every other column updatedAt is exactly right: it is when the piece
+ * reached that stage, so the column reads as longest-waiting-first.
+ *
+ * Returns a number, not an ISO string: the two sources have different
+ * precision ("…00Z" against "…00.000Z") and locale-aware string comparison
+ * can treat punctuation as ignorable.
+ */
+function sortKey(line: TrackedLine): number {
+  const iso =
+    line.column === UNTRIAGED
+      ? line.orderCreatedAt
+      : (line.updatedAt ?? line.orderCreatedAt);
+  return Date.parse(iso) || 0;
+}
+
+/** "12 Sep" — short enough for a card, exact enough to act on. */
+function shortDate(iso: string): string {
+  const d = new Date(iso);
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  return d.toLocaleDateString("en-GB", {
+    day: "2-digit",
+    month: "short",
+    ...(sameYear ? {} : { year: "numeric" }),
+  });
+}
+
+/**
  * "just now" / "6 min ago" / "2 h ago" — how current the cached order list is.
  * Minute granularity, unlike ageLabel, which measures days in a stage.
  */
@@ -408,6 +455,13 @@ export default function TrackPage() {
     const map = new Map<BoardColumn, TrackedLine[]>();
     for (const col of BOARD_COLUMNS) map.set(col, []);
     for (const line of filtered) map.get(line.column)!.push(line);
+
+    // Oldest first, so a column reads top-to-bottom as "longest waiting
+    // first". Without this the board inherits Shopify's fetch order, which is
+    // newest first: exactly backwards for a queue of work.
+    for (const lines of map.values()) {
+      lines.sort((a, b) => sortKey(a) - sortKey(b));
+    }
     return map;
   }, [filtered]);
 
@@ -741,29 +795,69 @@ export default function TrackPage() {
                                 <p className="tk-card-var">
                                   {line.variantTitle}
                                 </p>
+                                {/* Which run is carrying this piece. Without
+                                    it a card's stage looks like an individual
+                                    decision when it is usually just where the
+                                    whole run got to. */}
+                                {line.batchName && (
+                                  <p
+                                    className="tk-card-run"
+                                    title={`In production run "${line.batchName}"`}
+                                  >
+                                    {line.batchName}
+                                  </p>
+                                )}
                               </div>
                               <span className="tk-qty">{line.quantity}</span>
                             </div>
 
                             <div className="tk-card-foot">
-                              <span className="tk-order">{line.orderName}</span>
-                              {line.promisedDate && (
-                                <span
-                                  className="tk-due"
-                                  title={
-                                    `Promised ${line.promisedDate}` +
-                                    (line.note ? ` — ${line.note}` : "")
-                                  }
-                                >
-                                  {formatPromisedDate(line.promisedDate)}
-                                  {line.note ? " *" : ""}
-                                </span>
-                              )}
-                              {ageLabel(line.updatedAt) && (
-                                <span className="tk-age">
-                                  {ageLabel(line.updatedAt)}
-                                </span>
-                              )}
+                              {/* Metadata on its own row. Two dates and an
+                                  order number sharing a line with the action
+                                  buttons left no width for either date, so
+                                  the promised one was truncating to "25 …". */}
+                              <div className="tk-card-meta">
+                                <span className="tk-order">{line.orderName}</span>
+                                {line.promisedDate && (
+                                  <span
+                                    className="tk-due"
+                                    title={
+                                      `Promised ${line.promisedDate}` +
+                                      (line.note ? ` — ${line.note}` : "")
+                                    }
+                                  >
+                                    {/* Both dates are labelled. Unlabelled,
+                                        they are indistinguishable — and one is
+                                        a customer promise while the other is a
+                                        workshop fact. */}
+                                    Due {formatPromisedDate(line.promisedDate)}
+                                    {line.note ? " *" : ""}
+                                  </span>
+                                )}
+                                {(() => {
+                                  const when = updatedDate(line);
+                                  if (!when) return null;
+                                  return (
+                                    <span
+                                      className="tk-age"
+                                      title={
+                                        `Last updated ` +
+                                        new Date(when).toLocaleDateString(
+                                          "en-GB",
+                                          {
+                                            day: "2-digit",
+                                            month: "long",
+                                            year: "numeric",
+                                          }
+                                        ) +
+                                        ` — ${ageLabel(when)} ago`
+                                      }
+                                    >
+                                      Updated {shortDate(when)}
+                                    </span>
+                                  );
+                                })()}
+                              </div>
 
                               {col === UNTRIAGED ? (
                                 /* Triage: the only two choices at intake. */
@@ -845,6 +939,11 @@ export default function TrackPage() {
                   {editing.variantTitle} · {editing.orderName} · ×
                   {editing.quantity}
                 </p>
+                {/* Moving this piece alone will break it out of step with its
+                    run, so say which run that is before anyone does. */}
+                {editing.batchName && (
+                  <p className="tk-sheet-run">In run · {editing.batchName}</p>
+                )}
               </div>
               <button
                 className="tk-close"
@@ -1117,27 +1216,48 @@ const TRACK_CSS = `
   margin: 0; font-size: 12px; color: var(--color-neutral-600);
   overflow-wrap: anywhere;
 }
+/* The production run carrying this piece. Deliberately quiet — it is context
+   for the stage above it, not another thing to read first. */
+.tk-card-run {
+  display: inline-block; margin: 3px 0 0; padding: 1px 6px;
+  font-family: var(--font-heading); font-weight: 800; font-size: 10px;
+  letter-spacing: .04em; max-width: 100%;
+  border: 1px solid var(--color-divider); color: var(--color-neutral-600);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .tk-qty {
   font-family: var(--font-heading); font-weight: 800; font-size: 17px;
   color: var(--color-accent); flex: none;
 }
+/* Two rows, not one. A board column is ~250px wide; an order number, two
+   dates and two buttons on a single line left nothing for the dates, which is
+   what truncated the promised one to "25 …". */
 .tk-card-foot {
-  display: flex; align-items: center; gap: 8px; margin-top: 9px;
-  padding-top: 8px; border-top: 1px solid var(--color-divider);
+  display: flex; flex-direction: column; align-items: stretch; gap: 7px;
+  margin-top: 9px; padding-top: 8px;
+  border-top: 1px solid var(--color-divider);
+}
+.tk-card-meta {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px;
 }
 .tk-order {
   font-family: var(--font-heading); font-weight: 800; font-size: 11px;
 }
-.tk-age { font-size: 11px; color: var(--color-neutral-600); }
-
-/* The customer's requested date, shown as typed. Kept to one line so a long
-   note can't stretch the card. */
-.tk-due {
-  font-family: var(--font-heading); font-weight: 800; font-size: 11px;
-  color: var(--color-neutral-600);
-  max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+/* A workshop fact: when the piece was last touched. */
+.tk-age {
+  font-size: 11px; color: var(--color-neutral-600); white-space: nowrap;
 }
 
+/* A customer promise. Deliberately the louder of the two — it is the one with
+   a consequence. Still capped so a long note can't stretch the card. */
+.tk-due {
+  font-family: var(--font-heading); font-weight: 800; font-size: 11px;
+  color: var(--color-accent);
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* auto margin works on the cross axis too, so this still right-aligns now
+   that the foot is a column. */
 .tk-flags { margin-left: auto; display: inline-flex; gap: 5px; flex: none; }
 
 /* Triage flags, shown only on untriaged cards. */
@@ -1183,6 +1303,10 @@ const TRACK_CSS = `
 }
 .tk-sheet-title { font-weight: 800; font-size: 15px; margin: 0 0 3px; line-height: 1.25; }
 .tk-sheet-sub { margin: 0; font-size: 12px; color: #7d7979; }
+.tk-sheet-run {
+  margin: 4px 0 0; font-family: "Archivo", system-ui, sans-serif; font-weight: 800;
+  font-size: 11px; letter-spacing: .04em; color: #ec3013;
+}
 .tk-close {
   flex: none; background: transparent; border: none; cursor: pointer;
   color: #201e1d; padding: 2px; display: inline-flex;
@@ -1234,8 +1358,9 @@ const TRACK_CSS = `
   .tk-board[data-all="true"] .tk-col[data-empty="true"] { display: none; }
 
   /* Long product names and free-text dates must never widen a card. */
-  .tk-card-foot { flex-wrap: wrap; row-gap: 6px; }
-  .tk-due { max-width: 45vw; }
+  /* The foot is a column at every width now, so the old wrap override is
+     redundant; the cap on a long promised note still earns its place. */
+  .tk-due { max-width: 60vw; }
   .tk-app .input { min-height: 44px; }
   .tk-next { width: 34px; height: 34px; }
   /* Two date inputs side by side don't fit a phone — give each half a row. */

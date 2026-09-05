@@ -17,6 +17,7 @@ import type { Prisma } from "@prisma/client";
 
 import db from "../db.server";
 import { fetchOrderLines, type OrderLine } from "./picklist.server";
+import { LIVE_BATCH_STATUSES } from "./batching";
 import {
   cleanNote,
   cleanPromisedDate,
@@ -40,6 +41,15 @@ export interface TrackedLine extends OrderLine {
   column: BoardColumn;
   /** When the status last changed — drives the "sitting here N days" hint. */
   updatedAt: string | null;
+  /**
+   * The production run carrying this piece, if any.
+   *
+   * A stage on the board is often not an individual decision — it is where the
+   * whole run got to. Without this the board can't say why a card moved, and
+   * moving one card by hand looks identical to moving the run it belongs to.
+   */
+  batchId: string | null;
+  batchName: string | null;
 }
 
 export interface BoardData {
@@ -64,7 +74,7 @@ export interface BoardData {
  * an empty one is not, and the workshop's own statuses are unaffected either
  * way since those are never cached.
  */
-async function getOrderLines(
+export async function getOrderLines(
   admin: AdminApiContext,
   shop: string,
   opts: { force?: boolean } = {}
@@ -167,11 +177,30 @@ export async function getBoard(
 ): Promise<BoardData> {
   const { lines, fetchedAt, cached } = await getOrderLines(admin, shop, opts);
 
-  // One query for the whole board rather than per line.
-  const tracked = await db.trackedItem.findMany({
-    where: { shop, lineItemId: { in: lines.map((l) => l.lineItemId) } },
-  });
+  const lineItemIds = lines.map((l) => l.lineItemId);
+
+  // Two queries for the whole board rather than any per line.
+  const [tracked, batched] = await Promise.all([
+    db.trackedItem.findMany({ where: { shop, lineItemId: { in: lineItemIds } } }),
+    // Which live run, if any, is carrying each piece.
+    db.batchItem.findMany({
+      where: {
+        lineItemId: { in: lineItemIds },
+        batchProduct: {
+          batch: { shop, status: { in: [...LIVE_BATCH_STATUSES] } },
+        },
+      },
+      select: {
+        lineItemId: true,
+        batchProduct: { select: { batch: { select: { id: true, name: true } } } },
+      },
+    }),
+  ]);
+
   const byLineItem = new Map(tracked.map((t) => [t.lineItemId, t]));
+  const runFor = new Map(
+    batched.map((b) => [b.lineItemId, b.batchProduct.batch])
+  );
 
   const counts = emptyCounts();
 
@@ -187,6 +216,8 @@ export async function getBoard(
     const column = columnFor(status, stage);
     counts[column] += 1;
 
+    const run = runFor.get(line.lineItemId);
+
     return {
       ...line,
       status,
@@ -195,6 +226,8 @@ export async function getBoard(
       promisedDate: row?.promisedDate ?? null,
       column,
       updatedAt: row?.updatedAt.toISOString() ?? null,
+      batchId: run?.id ?? null,
+      batchName: run?.name ?? null,
     };
   });
 
