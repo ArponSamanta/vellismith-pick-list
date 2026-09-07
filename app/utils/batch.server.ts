@@ -776,9 +776,24 @@ function toBatchView(
       variantIds: product.variantIds,
       splitStage,
       splitDecidedAt: product.splitDecidedAt?.toISOString() ?? null,
-      // Only worth prompting for when there is more than one way to finish it.
+      // Worth prompting for when there is more than one way to finish it — or
+      // when the allocation no longer covers what is owed, which is how a
+      // split that WAS made goes stale: an order arrives afterwards for a
+      // finish that has no pieces set aside, and without this the run would
+      // sail past the split stage still holding the old answer.
+      //
+      // Driven off demand rather than off the finish rows, because the worst
+      // case is a variant with orders and NO row at all — a silver order
+      // absorbed into an all-gold run. Iterating the rows would never look at
+      // it, which is precisely how it stayed invisible.
       splitDue:
-        reachedSplit && !product.splitDecidedAt && product.finishes.length > 1,
+        reachedSplit &&
+        ((!product.splitDecidedAt && product.finishes.length > 1) ||
+          [...demand.entries()].some(
+            ([variantId, owed]) =>
+              owed >
+              (finishes.find((f) => f.variantId === variantId)?.quantity ?? 0)
+          )),
       finishes,
       lines,
       scraps: product.scraps
@@ -1611,6 +1626,53 @@ export async function addUnclaimedLines(params: {
     })),
     skipDuplicates: true,
   });
+
+  // Keep the allocation covering the demand it now holds.
+  //
+  // Without this, absorbing a silver order into a gold run created the order
+  // line and nothing else: the finishes still read 100% gold, allocated still
+  // equalled made so the product looked reconciled, and splitDue needs more
+  // than one finish — so the run could pass Plating, be marked Made, and write
+  // every piece to stock as gold with a silver order sitting unfilled.
+  //
+  // Only while the split is undecided. After it the quantities are a decision
+  // somebody made, and silently rewriting them would erase it; splitDue flags
+  // the shortfall instead so they can redo it deliberately.
+  if (!product.splitDecidedAt) {
+    const liveLines: TrackedLine[] = [
+      ...product.items
+        .map((i) => board.lines.find((l) => l.lineItemId === i.lineItemId))
+        .filter((l): l is TrackedLine => Boolean(l)),
+      ...affordable,
+    ];
+
+    const wanted = seedFinishes(liveLines, made);
+    const byVariant = new Map(product.finishes.map((f) => [f.variantId, f]));
+
+    await db.$transaction(async (tx) => {
+      for (const finish of wanted) {
+        const existing = byVariant.get(finish.variantId);
+        if (!existing) {
+          await tx.batchFinish.create({
+            data: { batchProductId: product.id, ...finish },
+          });
+        } else if (existing.quantity !== finish.quantity) {
+          await tx.batchFinish.update({
+            where: { id: existing.id },
+            data: { quantity: finish.quantity },
+          });
+        }
+      }
+      // A finish the covering default no longer includes. Safe to drop: no
+      // split has been made, so nothing here was chosen by hand.
+      const keep = new Set(wanted.map((f) => f.variantId));
+      for (const finish of product.finishes) {
+        if (!keep.has(finish.variantId)) {
+          await tx.batchFinish.delete({ where: { id: finish.id } });
+        }
+      }
+    });
+  }
 
   const status = isBatchStatus(batch.status) ? batch.status : "OPEN";
   const stage = (batch.stage as TrackStage | null) ?? null;

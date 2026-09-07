@@ -50,6 +50,7 @@ import {
   type FinishView,
   type ProductSelection,
 } from "../utils/batch.server";
+import type { CatalogVariant } from "../utils/catalog.server";
 import { writeBatchStock } from "../utils/inventory.server";
 import {
   BATCH_NAME_MAX,
@@ -750,6 +751,24 @@ export default function BatchPage() {
   const [source, setSource] = useState<"orders" | "catalog">("orders");
   const products = useFetcher<typeof productsLoader>();
 
+  /**
+   * Every variant each picked product HAS, not just the ones with orders.
+   *
+   * The scope chips were built from demand, so a product whose silver has
+   * never been ordered offered no way to say "this run is making silver too".
+   * That mattered most in the case it was meant to serve: gold ordered, run
+   * started, silver ordered afterwards while the pieces are still raw.
+   *
+   * Its own fetcher, deliberately — `products` is shared by the catalogue
+   * search and the plating handler, and a keystroke in the search box would
+   * overwrite a variant list mid-flight.
+   */
+  const pickVariants = useFetcher<typeof productsLoader>();
+  const [variantsByProduct, setVariantsByProduct] = useState<
+    Map<string, CatalogVariant[]>
+  >(new Map());
+  const [variantsLoading, setVariantsLoading] = useState<string | null>(null);
+
   // Stock dialog
   const [stockFor, setStockFor] = useState<BatchView | null>(null);
   const [locationId, setLocationId] = useState("");
@@ -917,6 +936,40 @@ export default function BatchPage() {
   }, [builder, source, builderSearch]);
 
   /**
+   * Fetch each picked product's variant list, one at a time.
+   *
+   * Serialised rather than fired in parallel because each is a live Shopify
+   * query and a merchant ticking through a list would otherwise open one per
+   * click. Results are cached for the life of the page, so unticking and
+   * re-ticking costs nothing.
+   */
+  useEffect(() => {
+    if (!builder || variantsLoading) return;
+    const next = [...picked.keys()].find((id) => !variantsByProduct.has(id));
+    if (!next) return;
+    setVariantsLoading(next);
+    pickVariants.load(`${PRODUCTS_ROUTE}?productId=${encodeURIComponent(next)}`);
+    // `pickVariants` is a stable fetcher; depending on it would loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [builder, picked, variantsByProduct, variantsLoading]);
+
+  useEffect(() => {
+    const pending = variantsLoading;
+    if (!pending || pickVariants.state !== "idle" || !pickVariants.data) return;
+
+    const list = pickVariants.data.variants.filter(
+      (v) => v.productId === pending
+    );
+    // A payload carrying only OTHER products is the previous request still
+    // sitting in the fetcher. Wait for ours rather than caching an empty list
+    // and concluding the product has no variants.
+    if (list.length === 0 && pickVariants.data.variants.length > 0) return;
+
+    setVariantsByProduct((m) => new Map(m).set(pending, list));
+    setVariantsLoading(null);
+  }, [pickVariants.state, pickVariants.data, variantsLoading]);
+
+  /**
    * The plating handler needs every variant of the product, not just the ones
    * with orders — plating pieces nobody has asked for is the normal case.
    */
@@ -988,6 +1041,42 @@ export default function BatchPage() {
    * clip-on orders, not the pierced ones sitting beside them, and the default
    * quantity follows it.
    */
+  /**
+   * Every variant this run could be scoped to, with what is on order for each.
+   *
+   * The product's real variant list once it has loaded, falling back to the
+   * ordered ones in the meantime so the chips never vanish and reappear.
+   * Ordered variants lead, because those are the ones a decision is usually
+   * about; a variant with nothing on order still has to be offered, since
+   * scoping to it is how you say "this run is making silver too" before any
+   * silver has been ordered.
+   */
+  const scopeOptions = (
+    p: PickedProduct
+  ): Array<{ variantId: string; variantTitle: string; pieces: number }> => {
+    const ordered = new Map(p.demand.map((d) => [d.variantId, d.pieces]));
+    const catalogue = variantsByProduct.get(p.productId) ?? [];
+
+    const rows =
+      catalogue.length > 0
+        ? catalogue.map((v) => ({
+            variantId: v.variantId,
+            variantTitle: v.variantTitle,
+            pieces: ordered.get(v.variantId) ?? 0,
+          }))
+        : p.demand.map((d) => ({
+            variantId: d.variantId,
+            variantTitle: d.variantTitle,
+            pieces: d.pieces,
+          }));
+
+    return rows.sort(
+      (a, b) =>
+        b.pieces - a.pieces ||
+        a.variantTitle.localeCompare(b.variantTitle)
+    );
+  };
+
   const committedFor = (p: PickedProduct): number =>
     p.scope.size === 0
       ? p.committed
@@ -1687,32 +1776,48 @@ export default function BatchPage() {
                                 : "")
                             : "stock only"}
                         </span>
-                        {/* Which variants' orders this run takes on. The
-                            casting is shared, so this narrows what the run is
-                            COMMITTED to, not what its pieces can become —
-                            untick everything and it goes back to taking all
-                            of them. */}
-                        {p.demand.length > 1 && (
-                          <span className="bt-scope">
-                            {p.demand.map((d) => {
-                              const on =
-                                p.scope.size === 0 || p.scope.has(d.variantId);
-                              return (
-                                <button
-                                  key={d.variantId}
-                                  type="button"
-                                  className={on ? "bt-chip on" : "bt-chip"}
-                                  aria-pressed={p.scope.has(d.variantId)}
-                                  onClick={() =>
-                                    toggleScope(p.productId, d.variantId)
-                                  }
-                                >
-                                  {d.pieces} {d.variantTitle || "—"}
-                                </button>
-                              );
-                            })}
-                          </span>
-                        )}
+                        {/* Which variants' orders this run takes on — EVERY
+                            variant the product has, not just the ordered ones.
+                            The casting is shared, so this narrows what the run
+                            is COMMITTED to, not what its pieces can become;
+                            untick everything and it goes back to taking all of
+                            them. Ticking a variant with nothing on order is
+                            how you say "and silver, when it comes". */}
+                        {(() => {
+                          const options = scopeOptions(p);
+                          if (options.length < 2) return null;
+                          return (
+                            <span className="bt-scope">
+                              {options.map((o) => {
+                                const on =
+                                  p.scope.size === 0 || p.scope.has(o.variantId);
+                                return (
+                                  <button
+                                    key={o.variantId}
+                                    type="button"
+                                    className={on ? "bt-chip on" : "bt-chip"}
+                                    aria-pressed={p.scope.has(o.variantId)}
+                                    title={
+                                      o.pieces > 0
+                                        ? `${o.pieces} on order`
+                                        : "none on order yet"
+                                    }
+                                    onClick={() =>
+                                      toggleScope(p.productId, o.variantId)
+                                    }
+                                  >
+                                    <b>{o.pieces}</b> {o.variantTitle || "—"}
+                                  </button>
+                                );
+                              })}
+                              {variantsLoading === p.productId && (
+                                <span className="bt-chip-load">
+                                  loading variants…
+                                </span>
+                              )}
+                            </span>
+                          );
+                        })()}
                       </span>
                       <label className="bt-qtycell">
                         <span className="bt-sr">
@@ -3621,6 +3726,10 @@ const BATCH_CSS = `
   border-color: var(--color-text); background: var(--color-text);
   color: var(--color-bg);
 }
+/* The order count leads the chip, so a variant with nothing ordered reads as
+   "0 Silver" — offerable, and visibly not the reason for this run. */
+.bt-chip b { font-weight: 800; }
+.bt-chip-load { font-size: 10px; color: var(--color-neutral-600); padding: 3px 0; }
 
 .bt-picker {
   border: 1px solid var(--color-divider); max-height: 300px; overflow-y: auto;
