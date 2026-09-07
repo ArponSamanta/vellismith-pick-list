@@ -33,7 +33,11 @@
  */
 
 import db from "../db.server";
-import { fetchVariants } from "./catalog.server";
+import {
+  fetchVariants,
+  searchVariants,
+  type CatalogVariant,
+} from "./catalog.server";
 import type { OrderLine } from "./picklist.server";
 import { fetchGrantedScopes } from "./picklist.server";
 import { getBoard, setStatus, type TrackedLine } from "./tracker.server";
@@ -1032,13 +1036,39 @@ async function prepareProducts(params: {
         inScope(selection.variantIds ?? [], l.variantId)
     );
 
-  // Only products with nothing outstanding need a catalogue lookup, so a run
-  // built purely from ordered work costs no extra Shopify call.
-  const needLookup = selections
-    .filter((s) => linesFor(s).length === 0)
-    .map((s) => s.productId);
-  const catalogue =
-    needLookup.length > 0 ? await fetchVariants(admin, needLookup) : new Map();
+  // Identity for everything the order lines can't supply. A run built purely
+  // from ordered work needs none of this and costs no extra Shopify call.
+  const catalogue = new Map<string, CatalogVariant>();
+
+  // Variants the run was scoped to with no order behind them — the whole point
+  // of scoping to one: "this run is making silver too, before any silver has
+  // been ordered". They need a title and SKU to become finish rows.
+  const scopedNeeds = selections.flatMap((s) => {
+    const ordered = new Set(linesFor(s).map((l) => l.variantId));
+    return (s.variantIds ?? []).filter((id) => !ordered.has(id));
+  });
+  if (scopedNeeds.length > 0) {
+    // fetchVariants takes VARIANT ids. It used to be handed product ids here,
+    // which match nothing in its `... on ProductVariant` query, so the lookup
+    // came back empty and a catalogue-only pick died on "that product no
+    // longer exists".
+    for (const [id, variant] of await fetchVariants(admin, scopedNeeds)) {
+      catalogue.set(id, variant);
+    }
+  }
+
+  // A product with neither orders nor a scoped variant still needs a title and
+  // image — picked from the catalogue tab purely to make stock.
+  const unknown = selections.filter(
+    (s) =>
+      linesFor(s).length === 0 &&
+      ![...catalogue.values()].some((v) => v.productId === s.productId)
+  );
+  for (const selection of unknown) {
+    for (const variant of await searchVariants(admin, "", selection.productId)) {
+      catalogue.set(variant.variantId, variant);
+    }
+  }
 
   await assertUnclaimed({
     shop,
@@ -1097,7 +1127,17 @@ async function prepareProducts(params: {
           quantity: l.quantity,
         })),
       },
-      finishes: { create: seedFinishes(lines, raw) },
+      // Scoped variants with no orders yet still get a finish row, so a run
+      // told to make silver as well as gold actually shows silver.
+      finishes: {
+        create: seedFinishes(
+          lines,
+          raw,
+          (selection.variantIds ?? [])
+            .map((id) => catalogue.get(id))
+            .filter((v): v is CatalogVariant => Boolean(v))
+        ),
+      },
     };
   });
 }
@@ -1110,7 +1150,24 @@ async function prepareProducts(params: {
  * pure stock. Deliberately a covering default rather than a guess at the real
  * split — nobody has to decide that until the pieces are polished.
  */
-function seedFinishes(lines: TrackedLine[], raw: number) {
+function seedFinishes(
+  lines: TrackedLine[],
+  raw: number,
+  /**
+   * Variants the run is scoped to that nobody has ordered yet.
+   *
+   * They get a row holding zero. Without this, ticking "Silver / Gold Plated"
+   * alongside "Pipe / Gold Plated" stored the scope and then produced a run
+   * showing only Pipe — the run had declared it was making silver and nothing
+   * anywhere reflected it. A zero row is also what makes splitDue fire, since
+   * that needs more than one finish to prompt with.
+   */
+  extras: ReadonlyArray<{
+    variantId: string;
+    variantTitle: string;
+    sku: string | null;
+  }> = []
+) {
   const demand = new Map<
     string,
     { variantId: string; variantTitle: string; sku: string | null; qty: number }
@@ -1126,6 +1183,13 @@ function seedFinishes(lines: TrackedLine[], raw: number) {
         sku: line.sku,
         qty: line.quantity,
       });
+  }
+
+  const declared = new Set<string>();
+  for (const extra of extras) {
+    if (demand.has(extra.variantId)) continue;
+    declared.add(extra.variantId);
+    demand.set(extra.variantId, { ...extra, qty: 0 });
   }
 
   const finishes = [...demand.values()].sort((a, b) => b.qty - a.qty);
@@ -1152,9 +1216,12 @@ function seedFinishes(lines: TrackedLine[], raw: number) {
     }> = [];
     let left = raw;
     for (const f of finishes) {
-      if (left <= 0) break;
-      const take = Math.min(f.qty, left);
+      const take = Math.max(0, Math.min(f.qty, left));
       left -= take;
+      // Nothing for this one — keep the row only if the run explicitly
+      // declared the variant. An unordered, unscoped finish holding zero is
+      // just a blank line on the run, the sheet and the stock dialog.
+      if (take === 0 && !declared.has(f.variantId)) continue;
       short.push({
         variantId: f.variantId,
         variantTitle: f.variantTitle,
@@ -1646,7 +1713,12 @@ export async function addUnclaimedLines(params: {
       ...affordable,
     ];
 
-    const wanted = seedFinishes(liveLines, made);
+    // Scoped variants keep their row through the re-seed. Their identity is
+    // already stored on the existing finishes, so this costs no lookup.
+    const declared = product.finishes.filter((f) =>
+      product.variantIds.includes(f.variantId)
+    );
+    const wanted = seedFinishes(liveLines, made, declared);
     const byVariant = new Map(product.finishes.map((f) => [f.variantId, f]));
 
     await db.$transaction(async (tx) => {
