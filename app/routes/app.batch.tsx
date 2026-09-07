@@ -47,6 +47,7 @@ import {
   type BatchCandidate,
   type BatchProductView,
   type BatchView,
+  type FinishView,
   type ProductSelection,
 } from "../utils/batch.server";
 import { writeBatchStock } from "../utils/inventory.server";
@@ -55,6 +56,7 @@ import {
   BATCH_NOTE_MAX,
   BATCH_STATUS_LABELS,
   SCRAP_NOTE_MAX,
+  isUnderPlanned,
   nextBatchStep,
   prevBatchStep,
   surplusOf,
@@ -156,6 +158,11 @@ const BATCH_PRINT_CSS = `
 const QTY_PREFIX = "qty:";
 /** Per-finish allocation fields in the plating handler. */
 const FINISH_PREFIX = "finish:";
+/**
+ * Which variants a product's run is filling orders for, repeated once per
+ * chosen variant. Absent for a product nobody narrowed, which means all.
+ */
+const SCOPE_PREFIX = "scope:";
 
 // ─── Server ───────────────────────────────────────────────────────────────
 
@@ -165,11 +172,17 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   return null;
 };
 
-/** Reads the repeated productId fields plus their matching qty:<id> field. */
+/** Reads the repeated productId fields plus their matching qty:/scope: fields. */
 function readSelections(form: FormData): ProductSelection[] {
   return form.getAll("productId").map((raw) => {
     const productId = String(raw);
-    return { productId, plannedQuantity: form.get(`${QTY_PREFIX}${productId}`) };
+    return {
+      productId,
+      plannedQuantity: form.get(`${QTY_PREFIX}${productId}`),
+      variantIds: form
+        .getAll(`${SCOPE_PREFIX}${productId}`)
+        .map((v) => String(v)),
+    };
   });
 }
 
@@ -550,7 +563,12 @@ interface PickedProduct {
   /** Outstanding pieces that still need making. Zero for a stock-only pick. */
   committed: number;
   /** Demand per finish, shown so the quantity is chosen with it in view. */
-  demand: Array<{ variantTitle: string; pieces: number }>;
+  demand: Array<{ variantId: string; variantTitle: string; pieces: number }>;
+  /**
+   * Variants whose orders this run takes on. Empty = every variant, which is
+   * the default and what most runs want.
+   */
+  scope: Set<string>;
   qty: string;
 }
 
@@ -562,7 +580,7 @@ interface PickRow {
   committed: number;
   readyPieces: number;
   orders: number;
-  demand: Array<{ variantTitle: string; pieces: number }>;
+  demand: Array<{ variantId: string; variantTitle: string; pieces: number }>;
   earliestPromised: string | null;
 }
 
@@ -603,6 +621,69 @@ function suggestAllocation(product: BatchProductView): Record<string, string> {
   return out;
 }
 
+/**
+ * Which variants a narrowed run is taking orders for, by name.
+ *
+ * "this variant only" was true but useless on a run holding several — it never
+ * said WHICH, so the reader still had to work out why an order wasn't being
+ * offered. Names come from the finishes, which are seeded from the very lines
+ * the scope let in; a scope entry with no finish yet falls back to a count.
+ */
+function scopeLabel(product: BatchProductView): string {
+  const names = product.variantIds
+    .map((id) => product.finishes.find((f) => f.variantId === id)?.variantTitle)
+    .filter((name): name is string => Boolean(name));
+
+  if (names.length === 0) {
+    return `${product.variantIds.length} ${
+      product.variantIds.length === 1 ? "variant" : "variants"
+    } only`;
+  }
+  return `${names.join(", ")} only`;
+}
+
+/**
+ * What still has to happen to one finish, as a sentence.
+ *
+ * A bare "Plating" was a stage name where a statement was needed. It never said
+ * whether that stage was still to come or had been ruled out for this variant,
+ * and two rows reading "Plating" and "no further stages" looked like different
+ * kinds of fact rather than the two answers to one question.
+ *
+ * The tense turns on whether the split has been DECIDED. Before it, this is the
+ * route saying what is going to happen; after it, the pieces exist and it is
+ * what is left to do to them. Named from the split stage rather than hardcoding
+ * "plating", so a product that splits somewhere else still reads correctly.
+ */
+function routeWords(opts: {
+  doneAtSplit: boolean;
+  remaining: readonly TrackStage[];
+  splitStage: TrackStage | null;
+  /** True once the split has actually been made, which changes the tense. */
+  decided: boolean;
+}): string {
+  if (opts.doneAtSplit) {
+    if (opts.decided) return "no further stages";
+    return opts.splitStage
+      ? `does not require ${STAGE_LABELS[opts.splitStage].toLowerCase()}`
+      : "no further stages";
+  }
+
+  const stages = opts.remaining
+    .map((s) => STAGE_LABELS[s].toLowerCase())
+    .join(" → ");
+  return opts.decided ? `still requires ${stages}` : `needs ${stages}`;
+}
+
+function finishRoute(product: BatchProductView, finish: FinishView): string {
+  return routeWords({
+    doneAtSplit: finish.doneAtSplit,
+    remaining: finish.remainingStages,
+    splitStage: product.splitStage,
+    decided: Boolean(product.splitDecidedAt),
+  });
+}
+
 function rowFromCandidate(c: BatchCandidate): PickRow {
   return {
     productId: c.productId,
@@ -612,6 +693,7 @@ function rowFromCandidate(c: BatchCandidate): PickRow {
     readyPieces: c.readyPieces,
     orders: c.lines.length,
     demand: c.variants.map((v) => ({
+      variantId: v.variantId,
       variantTitle: v.variantTitle,
       pieces: v.pieces,
     })),
@@ -892,8 +974,48 @@ export default function BatchPage() {
     imageUrl: row.imageUrl,
     committed: row.committed,
     demand: row.demand,
+    // Unnarrowed by default: a run takes all of a product's work unless the
+    // merchant says otherwise, which is how every run behaved before scope
+    // existed.
+    scope: new Set<string>(),
     qty: String(row.committed || 1),
   });
+
+  /**
+   * Pieces this pick is actually committed to, given its scope.
+   *
+   * The whole point of narrowing: a clip-on run's committed total counts the
+   * clip-on orders, not the pierced ones sitting beside them, and the default
+   * quantity follows it.
+   */
+  const committedFor = (p: PickedProduct): number =>
+    p.scope.size === 0
+      ? p.committed
+      : p.demand
+          .filter((d) => p.scope.has(d.variantId))
+          .reduce((sum, d) => sum + d.pieces, 0);
+
+  /**
+   * Tick or untick one variant. Unticking the last one returns the pick to
+   * "all variants" rather than to a run committed to nothing.
+   */
+  const toggleScope = (productId: string, variantId: string) => {
+    setPicked((current) => {
+      const existing = current.get(productId);
+      if (!existing) return current;
+      const scope = new Set(existing.scope);
+      if (scope.has(variantId)) scope.delete(variantId);
+      else scope.add(variantId);
+      const updated = { ...existing, scope };
+      // Keep the quantity following the commitment while it is untouched by
+      // hand — otherwise narrowing to one variant leaves the old, larger
+      // number sitting in the box as a silent over-plan.
+      if (existing.qty === String(committedFor(existing) || 1)) {
+        updated.qty = String(committedFor(updated) || 1);
+      }
+      return new Map(current).set(productId, updated);
+    });
+  };
 
   const togglePick = (row: PickRow) => {
     setPicked((current) => {
@@ -979,6 +1101,7 @@ export default function BatchPage() {
         orders: c?.lines.length ?? 0,
         demand:
           c?.variants.map((x) => ({
+            variantId: x.variantId,
             variantTitle: x.variantTitle,
             pieces: x.pieces,
           })) ?? [],
@@ -1006,7 +1129,12 @@ export default function BatchPage() {
   // Builder arithmetic, live as you type. Driven by the picks themselves, not
   // by either list, so switching source never disturbs the totals.
   const pickedList = [...picked.values()];
-  const builderCommitted = pickedList.reduce((sum, p) => sum + p.committed, 0);
+  // Scoped, not raw: a narrowed pick is only committed to the variants it took
+  // on, and the surplus and under-plan warning both read off this.
+  const builderCommitted = pickedList.reduce(
+    (sum, p) => sum + committedFor(p),
+    0
+  );
   const builderPlanned = pickedList.reduce(
     (sum, p) => sum + (Number(p.qty) || 0),
     0
@@ -1521,6 +1649,21 @@ export default function BatchPage() {
                 </div>
               </div>
 
+              {/* Making fewer than are owed is allowed — there is only so much
+                  silver, and the rest can go in the next run. It is stated
+                  rather than corrected: the quantity used to be silently
+                  raised to the committed total, which overwrote a number the
+                  merchant had deliberately typed. */}
+              {isUnderPlanned(builderPlanned, builderCommitted) && (
+                <p className="bt-warn-note">
+                  This run makes {builderPlanned} but {builderCommitted}{" "}
+                  {builderCommitted === 1 ? "is" : "are"} on order — it will be
+                  short by {builderCommitted - builderPlanned}. Fine if the
+                  rest follows in another run; the shortfall stays visible on
+                  the run until it is covered.
+                </p>
+              )}
+
               {/* Picks stay listed here whichever source they came from, so
                   switching tabs or searching never hides what is already in
                   the run — and every quantity stays editable in one place. */}
@@ -1538,25 +1681,50 @@ export default function BatchPage() {
                         <span className="bt-pick-title">{p.productTitle}</span>
                         <span className="bt-pick-sub">
                           {p.committed > 0
-                            ? `${p.committed} on order` +
-                              (p.demand.length > 0
-                                ? ` — ${p.demand
-                                    .map(
-                                      (d) => `${d.pieces} ${d.variantTitle || "—"}`
-                                    )
-                                    .join(", ")}`
+                            ? `${committedFor(p)} on order` +
+                              (p.scope.size > 0
+                                ? ` of ${p.committed}`
                                 : "")
                             : "stock only"}
                         </span>
+                        {/* Which variants' orders this run takes on. The
+                            casting is shared, so this narrows what the run is
+                            COMMITTED to, not what its pieces can become —
+                            untick everything and it goes back to taking all
+                            of them. */}
+                        {p.demand.length > 1 && (
+                          <span className="bt-scope">
+                            {p.demand.map((d) => {
+                              const on =
+                                p.scope.size === 0 || p.scope.has(d.variantId);
+                              return (
+                                <button
+                                  key={d.variantId}
+                                  type="button"
+                                  className={on ? "bt-chip on" : "bt-chip"}
+                                  aria-pressed={p.scope.has(d.variantId)}
+                                  onClick={() =>
+                                    toggleScope(p.productId, d.variantId)
+                                  }
+                                >
+                                  {d.pieces} {d.variantTitle || "—"}
+                                </button>
+                              );
+                            })}
+                          </span>
+                        )}
                       </span>
                       <label className="bt-qtycell">
                         <span className="bt-sr">
                           Raw pieces to make of {p.productTitle}
                         </span>
+                        {/* Floored at 1, not at the committed total. Making
+                            fewer than are owed is allowed — the shortfall is
+                            reported rather than prevented. */}
                         <input
                           className="input bt-qty-input"
                           type="number"
-                          min={Math.max(p.committed, 1)}
+                          min={1}
                           inputMode="numeric"
                           value={p.qty}
                           onChange={(e) => setQty(p.productId, e.target.value)}
@@ -1718,14 +1886,21 @@ export default function BatchPage() {
                 disabled={busy || picked.size === 0}
                 onClick={() => {
                   const productIds = [...picked.keys()];
-                  const quantities: Record<string, string> = {};
+                  const quantities: Record<string, string | string[]> = {};
                   for (const p of pickedList) {
-                    // Never send less than is owed, and never zero. The server
-                    // enforces both, but sending a sane value keeps what was
-                    // confirmed on screen and what gets stored identical.
+                    // Floored at one, and NOT at the committed total. Raising
+                    // it to what was owed silently overwrote a number the
+                    // merchant had chosen — deciding to make two against five
+                    // orders is an ordinary call, and the shortfall is
+                    // reported rather than prevented.
                     quantities[`${QTY_PREFIX}${p.productId}`] = String(
-                      Math.max(Number(p.qty) || 0, p.committed, 1)
+                      Math.max(Number(p.qty) || 0, 1)
                     );
+                    // Omitted entirely when nothing is narrowed, so the server
+                    // sees an empty scope and takes every variant.
+                    if (p.scope.size > 0) {
+                      quantities[`${SCOPE_PREFIX}${p.productId}`] = [...p.scope];
+                    }
                   }
                   submit({
                     intent: builder.kind === "create" ? "create" : "add-products",
@@ -1816,11 +1991,17 @@ export default function BatchPage() {
                         </span>
                         <span className="bt-pick-sub">
                           {owed > 0 ? `${owed} on order · ` : ""}
-                          {option.doneAtSplit
-                            ? "finished once allocated"
-                            : `still needs ${option.remaining
-                                .map((s) => STAGE_LABELS[s])
-                                .join(", ")}`}
+                          {/* Always the undecided tense here: this dialog IS
+                              the decision, so it reads "needs / does not
+                              require", and the run's own list switches to
+                              "still requires / no further stages" once it has
+                              been made. */}
+                          {routeWords({
+                            doneAtSplit: option.doneAtSplit,
+                            remaining: option.remaining,
+                            splitStage: splitting.product.splitStage,
+                            decided: false,
+                          })}
                         </span>
                       </span>
                       <label className="bt-qtycell">
@@ -2238,9 +2419,13 @@ function BatchCard({
 
       {batch.shortfallTotal > 0 && (
         <div className="bt-error bt-error-inline">
+          {/* Two ways to get here now: breakage eating past the surplus, or a
+              run deliberately planned smaller than its orders. Naming only
+              breakage sent the reader looking for damage that never
+              happened. */}
           Short by {batch.shortfallTotal}{" "}
-          {batch.shortfallTotal === 1 ? "piece" : "pieces"} — breakage has eaten
-          past the surplus, so there are orders this run can no longer fill.
+          {batch.shortfallTotal === 1 ? "piece" : "pieces"} — this run makes
+          fewer than it owes, so there are orders it can&apos;t fill.
           {/* Raising the quantity only helps while nothing has been shaped
               yet. Past Casting the extra pieces would have to start from the
               beginning, which is a new run, not a bigger one. */}
@@ -2502,6 +2687,12 @@ function ProductRow({
             {product.splitStage && product.finishes.length > 1
               ? `splits at ${STAGE_LABELS[product.splitStage]}`
               : "single finish"}
+            {/* A narrowed run looks identical to an unnarrowed one otherwise,
+                and the difference matters: it explains why new orders for the
+                other variants are not being offered to it. */}
+            {product.variantIds.length > 0 && (
+              <span className="bt-scoped"> · orders: {scopeLabel(product)}</span>
+            )}
           </div>
         </div>
 
@@ -2510,7 +2701,9 @@ function ProductRow({
             <input
               className="input bt-qty-input"
               type="number"
-              min={product.committed}
+              // Not floored at committed: lowering a run below what it owes is
+              // allowed, and the shortfall is reported on the run.
+              min={1}
               // eslint-disable-next-line jsx-a11y/no-autofocus
               autoFocus
               value={qty}
@@ -2656,11 +2849,7 @@ function ProductRow({
                 <span className="bt-finish-qty">{finish.quantity}</span>
                 <span className="bt-finish-state">
                   {finish.committed > 0 ? `${finish.committed} on order · ` : ""}
-                  {finish.doneAtSplit
-                    ? "no further stages"
-                    : finish.remainingStages
-                        .map((s) => STAGE_LABELS[s])
-                        .join(" → ")}
+                  {finishRoute(product, finish)}
                 </span>
                 {finish.inventoryDelta !== null && (
                   <span className="bt-finish-done">
@@ -3105,6 +3294,12 @@ const BATCH_CSS = `
 
 .bt-inline-warn { font-size: 12px; color: #7c1405; margin: 8px 0 0; }
 .bt-inline-note { font-size: 12px; color: var(--color-neutral-600); margin: 10px 0 0; }
+/* An allowed choice with a consequence, not an error: amber and stated, but
+   it never blocks the submit. */
+.bt-warn-note {
+  font-size: 12px; color: #8a5a00; margin: 10px 0 0;
+  border-left: 3px solid #8a5a00; padding-left: 10px;
+}
 
 .bt-stages { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 14px; }
 .bt-stage {
@@ -3410,6 +3605,22 @@ const BATCH_CSS = `
 }
 .bt-chosen-row:last-child { border-bottom: none; }
 .bt-chosen-row .bt-pick-text { flex: 1 1 auto; min-width: 0; }
+
+/* Which variants' orders the run takes on. All chips read as "on" while
+   nothing is narrowed, because that IS the state: an unnarrowed run takes
+   every variant. Ticking one is what starts excluding the others. */
+.bt-scoped { color: var(--color-accent); font-weight: 800; }
+.bt-scope { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.bt-chip {
+  font-family: var(--font-heading); font-weight: 800; font-size: 10px;
+  padding: 3px 7px; cursor: pointer;
+  border: 1px solid var(--color-divider);
+  background: transparent; color: var(--color-neutral-600);
+}
+.bt-chip.on {
+  border-color: var(--color-text); background: var(--color-text);
+  color: var(--color-bg);
+}
 
 .bt-picker {
   border: 1px solid var(--color-divider); max-height: 300px; overflow-y: auto;

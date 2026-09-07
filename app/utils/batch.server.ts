@@ -136,6 +136,14 @@ export interface BatchProductView {
   surplus: number;
   shortfall: number;
 
+  /**
+   * Variants whose orders this run takes on. Empty = all of them.
+   *
+   * Commitments, not capability: the pieces can still become any variant, so
+   * the split handler ignores this entirely.
+   */
+  variantIds: string[];
+
   splitStage: TrackStage | null;
   splitDecidedAt: string | null;
   /** The run has reached the split stage and nobody has allocated yet. */
@@ -387,6 +395,8 @@ function planAllocation(
           (p) => p.productId === candidate.productId
         );
         if (!product) continue;
+        // A narrowed run is only offered the variants it is making.
+        if (!inScope(product.variantIds, line.variantId)) continue;
 
         // Before the split, spare is raw and any finish may draw on it. After
         // it, the pieces are already committed to a finish.
@@ -692,6 +702,12 @@ function toBatchView(
     const closed = lines.filter((l) => l.liveQuantity === null).length;
     closedLines += closed;
 
+    // New orders this run could still take on: unclaimed, for this product,
+    // and within whatever variant scope the run was narrowed to.
+    const unclaimedInScope = (
+      candidates.get(product.productId)?.lines ?? []
+    ).filter((l) => inScope(product.variantIds, l.variantId));
+
     const scrapped = product.scraps.reduce((sum, s) => sum + s.quantity, 0);
     const made = madeQuantity(product.plannedQuantity, scrapped);
     const committed = lines.reduce((sum, l) => sum + (l.liveQuantity ?? 0), 0);
@@ -757,6 +773,7 @@ function toBatchView(
       committed,
       surplus: surplusOf(made, committed),
       shortfall: shortfallOf(product.plannedQuantity, scrapped, committed),
+      variantIds: product.variantIds,
       splitStage,
       splitDecidedAt: product.splitDecidedAt?.toISOString() ?? null,
       // Only worth prompting for when there is more than one way to finish it.
@@ -776,8 +793,15 @@ function toBatchView(
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
       closedLines: closed,
       changedLines: lines.filter((l) => l.changed).length,
-      unclaimedLines: candidates.get(product.productId)?.lines.length ?? 0,
-      unclaimedPieces: candidates.get(product.productId)?.pieces ?? 0,
+      // Scoped, exactly as addUnclaimedLines scopes what it will claim. When
+      // this counted every variant, a run narrowed to Sunset offered to absorb
+      // three new Ice and Powder orders and then refused with "there are no
+      // new orders to make" — the banner promising work the button wouldn't do.
+      //
+      // Summed from the lines rather than read off candidate.pieces for the
+      // same reason: that figure is the product's whole outstanding total.
+      unclaimedLines: unclaimedInScope.length,
+      unclaimedPieces: unclaimedInScope.reduce((sum, l) => sum + l.quantity, 0),
       earliestPromised: earliestOf(lines),
     };
   });
@@ -839,6 +863,22 @@ export interface ProductSelection {
   productId: string;
   /** Raw pieces to make. */
   plannedQuantity: unknown;
+  /**
+   * Which variants' orders this run takes on. Empty or absent = all of them.
+   *
+   * Scopes commitments, not capability — see BatchProduct.variantIds.
+   */
+  variantIds?: string[];
+}
+
+/**
+ * Does this run's scope cover that variant?
+ *
+ * Empty scope means every variant, which is both the historical behaviour and
+ * the sensible default: a run nobody has narrowed should take the work.
+ */
+function inScope(scope: readonly string[], variantId: string): boolean {
+  return scope.length === 0 || scope.includes(variantId);
 }
 
 /**
@@ -964,18 +1004,23 @@ async function prepareProducts(params: {
   // Must agree with buildCandidates exactly: the card offers untriaged pieces,
   // so the run has to claim untriaged pieces. If this filter were any wider,
   // a card reading "4 to make" would silently start a run committed to 15.
-  const linesFor = (productId: string) =>
+  //
+  // The scope narrows it further, to the variants this run is actually making.
+  // A clip-on run casts pieces that COULD become pierced, but it should not be
+  // handed the pierced orders — those belong to whoever makes them.
+  const linesFor = (selection: ProductSelection) =>
     board.lines.filter(
       (l) =>
-        l.productId === productId &&
+        l.productId === selection.productId &&
         !claimedIds.has(l.lineItemId) &&
-        isClaimable(l)
+        isClaimable(l) &&
+        inScope(selection.variantIds ?? [], l.variantId)
     );
 
   // Only products with nothing outstanding need a catalogue lookup, so a run
   // built purely from ordered work costs no extra Shopify call.
   const needLookup = selections
-    .filter((s) => linesFor(s.productId).length === 0)
+    .filter((s) => linesFor(s).length === 0)
     .map((s) => s.productId);
   const catalogue =
     needLookup.length > 0 ? await fetchVariants(admin, needLookup) : new Map();
@@ -983,12 +1028,12 @@ async function prepareProducts(params: {
   await assertUnclaimed({
     shop,
     lineItemIds: selections.flatMap((s) =>
-      linesFor(s.productId).map((l) => l.lineItemId)
+      linesFor(s).map((l) => l.lineItemId)
     ),
   });
 
   return selections.map((selection) => {
-    const lines = linesFor(selection.productId);
+    const lines = linesFor(selection);
     const sample = lines[0];
     const known = [...catalogue.values()].find(
       (v) => v.productId === selection.productId
@@ -1014,8 +1059,7 @@ async function prepareProducts(params: {
       );
     }
 
-    const committed = lines.reduce((sum, l) => sum + l.quantity, 0);
-    const raw = cleanPlannedQuantity(selection.plannedQuantity, committed);
+    const raw = cleanPlannedQuantity(selection.plannedQuantity);
     if (raw === null || raw === 0) {
       throw new BatchError(
         `Enter how many pieces of ${identity.productTitle} the run will make.`
@@ -1025,6 +1069,9 @@ async function prepareProducts(params: {
     return {
       ...identity,
       plannedQuantity: raw,
+      // Stored so later claims — the manual add and the auto-allocate banner —
+      // apply the same narrowing the merchant chose when starting the run.
+      variantIds: selection.variantIds ?? [],
       splitStage: "PLATING",
       items: {
         create: lines.map((l) => ({
@@ -1070,7 +1117,40 @@ function seedFinishes(lines: TrackedLine[], raw: number) {
   if (finishes.length === 0) return [];
 
   const committed = finishes.reduce((sum, f) => sum + f.qty, 0);
-  const surplus = Math.max(0, raw - committed);
+
+  // Under-planned: fewer pieces than orders. Hand them out in demand order
+  // until they run out, and create no row for a finish that gets none — a
+  // finish holding zero pieces is not a finish, and it would render as a
+  // blank line on the run, the sheet and the stock dialog.
+  //
+  // The invariant this protects is that the finishes sum to EXACTLY the
+  // planned quantity. Giving every finish its full demand here would have the
+  // run claiming more pieces than it makes, and the stock write adds
+  // finish.quantity — so the difference would land in Shopify as inventory
+  // that does not exist.
+  if (raw < committed) {
+    const short: Array<{
+      variantId: string;
+      variantTitle: string;
+      sku: string | null;
+      quantity: number;
+    }> = [];
+    let left = raw;
+    for (const f of finishes) {
+      if (left <= 0) break;
+      const take = Math.min(f.qty, left);
+      left -= take;
+      short.push({
+        variantId: f.variantId,
+        variantTitle: f.variantTitle,
+        sku: f.sku,
+        quantity: take,
+      });
+    }
+    return short;
+  }
+
+  const surplus = raw - committed;
 
   return finishes.map((f, i) => ({
     variantId: f.variantId,
@@ -1356,38 +1436,80 @@ export async function updateBatchProduct(params: {
   const product = batch.products.find((p) => p.id === params.batchProductId);
   if (!product) throw new BatchError("That product isn't in this run.");
 
-  // Floored on the LIVE committed total: order editing can raise a line's
-  // quantity in place, so the stored snapshots can be smaller than what is
-  // owed, and flooring on them would accept a run that makes too few.
-  const board = await getBoard(params.admin, params.shop);
-  const owed = new Map(board.lines.map((l) => [l.lineItemId, l.quantity]));
-  const committed = product.items.reduce(
-    (sum, i) => sum + (owed.get(i.lineItemId) ?? 0),
-    0
-  );
-
-  const raw = cleanPlannedQuantity(params.plannedQuantity, committed);
+  const raw = cleanPlannedQuantity(params.plannedQuantity);
   if (raw === null) throw new BatchError("Enter a whole number of pieces.");
+  // Zero would empty every finish and leave a product in the run making
+  // nothing, which reads as a bug rather than a decision.
+  if (raw === 0) {
+    throw new BatchError(
+      "A run has to make at least one piece. Remove the product instead."
+    );
+  }
 
   await db.$transaction(async (tx) => {
     await tx.batchProduct.update({
       where: { id: product.id },
       data: { plannedQuantity: raw },
     });
-    // Keep the allocation covering: put the change on the largest finish so
-    // the product stays reconciled without anyone re-splitting.
+
     const scrapped = product.scraps.reduce((sum, s) => sum + s.quantity, 0);
     const target = madeQuantity(raw, scrapped);
-    const finishes = [...product.finishes].sort((a, b) => b.quantity - a.quantity);
-    const allocated = finishes.reduce((sum, f) => sum + f.quantity, 0);
-    const delta = target - allocated;
-    if (delta !== 0 && finishes[0]) {
-      await tx.batchFinish.update({
-        where: { id: finishes[0].id },
-        data: { quantity: Math.max(0, finishes[0].quantity + delta) },
-      });
+    for (const { id, quantity } of rebalanceFinishes(product.finishes, target)) {
+      await tx.batchFinish.update({ where: { id }, data: { quantity } });
     }
   });
+}
+
+/**
+ * Move an existing allocation to a new total, and land on it exactly.
+ *
+ * Growth is easy: it all goes on the largest finish, which is the covering
+ * default everywhere else in this file.
+ *
+ * Shrinkage is where the old code broke. It put the whole change on the
+ * largest finish and clamped at zero, so lowering a run from ten pieces to one
+ * drove that finish negative, clamped it, and left the finishes totalling more
+ * than the run makes — pieces that do not exist, which the stock write would
+ * have posted to Shopify. Instead this takes one piece at a time from whoever
+ * currently holds the most, which can never drive a finish negative, never
+ * empties one while another is still full, and always terminates on target.
+ *
+ * Returns only the finishes whose quantity actually changed.
+ */
+function rebalanceFinishes(
+  finishes: ReadonlyArray<{ id: string; quantity: number }>,
+  target: number
+): Array<{ id: string; quantity: number }> {
+  if (finishes.length === 0) return [];
+
+  const next = new Map(finishes.map((f) => [f.id, f.quantity]));
+  const allocated = [...next.values()].reduce((sum, n) => sum + n, 0);
+  let delta = target - allocated;
+
+  if (delta > 0) {
+    const largest = [...finishes].sort((a, b) => b.quantity - a.quantity)[0];
+    next.set(largest.id, (next.get(largest.id) ?? 0) + delta);
+  } else {
+    while (delta < 0) {
+      let biggestId: string | null = null;
+      let biggest = 0;
+      for (const [id, n] of next) {
+        if (n > biggest) {
+          biggest = n;
+          biggestId = id;
+        }
+      }
+      // Every finish is already at zero: the target is unreachable from here,
+      // which only happens if it was negative. Stop rather than spin.
+      if (!biggestId) break;
+      next.set(biggestId, biggest - 1);
+      delta += 1;
+    }
+  }
+
+  return finishes
+    .filter((f) => next.get(f.id) !== f.quantity)
+    .map((f) => ({ id: f.id, quantity: next.get(f.id)! }));
 }
 
 export async function removeProductFromBatch(params: {
@@ -1436,11 +1558,14 @@ export async function addUnclaimedLines(params: {
   const claimedIds = await claimedLineIds(params.shop);
   const routes = await loadRoutes(params.shop);
 
+  // Same narrowing the run was created with: a clip-on run doesn't absorb new
+  // pierced orders just because it happens to have raw pieces going spare.
   const fresh = board.lines.filter(
     (l) =>
       l.productId === product.productId &&
       !claimedIds.has(l.lineItemId) &&
-      isClaimable(l)
+      isClaimable(l) &&
+      inScope(product.variantIds, l.variantId)
   );
   if (fresh.length === 0) {
     throw new BatchError("There are no new orders to make for that product.");

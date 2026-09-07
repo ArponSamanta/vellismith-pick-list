@@ -78,21 +78,32 @@ export function isUnderPlanned(planned: number, committed: number): boolean {
 }
 
 /**
- * A planned quantity that is safe to store: a whole number, at least the
- * committed total, and below the typo ceiling. Returns null when the input
- * can't be read as a number at all, so the caller can reject rather than
- * silently substituting a value nobody chose.
+ * A planned quantity that is safe to store: a whole number below the typo
+ * ceiling. Returns null when the input can't be read as a number at all, so
+ * the caller can reject rather than silently substituting a value nobody
+ * chose.
+ *
+ * Deliberately NOT floored at the committed total. It used to be, and that
+ * quietly rewrote the merchant's number: typing 2 against five orders stored
+ * 5. Making fewer pieces than are owed is an ordinary decision — there is
+ * only so much silver, or the rest goes in next week's run — and the model
+ * already has the vocabulary for it in isUnderPlanned and shortfallOf. The
+ * floor meant isUnderPlanned could only ever fire when orders GREW after the
+ * run started, which was never the whole of what it was for.
  */
-export function cleanPlannedQuantity(
-  value: unknown,
-  committed: number
-): number | null {
-  const n =
-    typeof value === "number" ? value : Number(String(value ?? "").trim());
+export function cleanPlannedQuantity(value: unknown): number | null {
+  const text = typeof value === "number" ? String(value) : String(value ?? "").trim();
+  // Number("") is 0, not NaN. Without this an emptied quantity box would read
+  // as a deliberate "make zero of these" — which, on an existing run, zeroes
+  // every finish. Blank means the merchant hasn't answered, so reject it and
+  // let the caller ask again.
+  if (text === "") return null;
+
+  const n = Number(text);
   if (!Number.isFinite(n)) return null;
   const whole = Math.floor(n);
   if (whole < 0) return null;
-  return Math.min(PLANNED_MAX, Math.max(committed, whole));
+  return Math.min(PLANNED_MAX, whole);
 }
 
 // ── Stage spread ──────────────────────────────────────────────────────────

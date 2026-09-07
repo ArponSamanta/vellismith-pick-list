@@ -190,6 +190,20 @@ model BatchProduct {
   /// and only survivors may be allocated to a finish or written to stock.
   plannedQuantity Int
 
+  /// Which of the product's variants this run is FILLING ORDERS for.
+  ///
+  /// Empty means all of them, which is what every run did before this existed
+  /// and what most runs still want.
+  ///
+  /// This scopes commitments, NOT capability. The casting is shared — a clip-on
+  /// and a pierced version of the same design come off the same tree — so the
+  /// pieces can still become any variant, and the split handler goes on
+  /// offering the whole catalogue. What this says is narrower: "this run is
+  /// making clip-ons, so don't hand it the pierced orders." Without it a run
+  /// claimed every outstanding line for the product and locked orders it never
+  /// intended to fill into a run that wasn't making them.
+  variantIds String[] @default([])
+
   /// The stage at which finishes are decided, from the tracking.ts
   /// vocabulary. Null means this product has no split at all — a single
   /// finish carries the whole quantity from start to finish.
