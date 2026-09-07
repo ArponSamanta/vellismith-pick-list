@@ -640,6 +640,7 @@ export default function BatchPage() {
   const candidates = useMemo(() => data.data?.candidates ?? [], [data.data]);
   const suggestions = useMemo(() => data.data?.suggestions ?? [], [data.data]);
   const readyToShipPieces = data.data?.readyToShipPieces ?? 0;
+  const inProductionPieces = data.data?.inProductionPieces ?? 0;
   const nextRunName = data.data?.nextRunName ?? "";
   const canWriteInventory = data.data?.canWriteInventory ?? false;
   const loadError = data.data?.error ?? null;
@@ -1176,6 +1177,15 @@ export default function BatchPage() {
             <div className="bt-stat-last">
               <div className="bt-stat-n">{unbatchedPieces}</div>
               <div className="bt-stat-l">Still to make</div>
+              {/* Both are pieces this number deliberately excludes, and the
+                  reason differs: in-production metal exists but isn't
+                  finished, ready-to-ship metal is finished. Neither is work
+                  to start, which is what the headline counts. */}
+              {inProductionPieces > 0 && (
+                <div className="bt-stat-sub">
+                  +{inProductionPieces} part-made, outside any run
+                </div>
+              )}
               {readyToShipPieces > 0 && (
                 <div className="bt-stat-sub">
                   +{readyToShipPieces} already ready to ship
@@ -1183,14 +1193,6 @@ export default function BatchPage() {
               )}
             </div>
           </div>
-
-          <p className="bt-legend">
-            A run makes many variants together. Per variant, <b>planned</b>{" "}
-            pieces are made, <b>committed</b> go to orders, and the{" "}
-            <b>surplus</b> becomes stock. The whole planned quantity is what
-            gets written to Shopify — it already holds the ordered pieces back
-            as committed, so only the surplus becomes sellable.
-          </p>
 
           <div className="bt-toolbar">
             <input
@@ -1315,14 +1317,17 @@ export default function BatchPage() {
               )}
             </h2>
             <p className="bt-legend">
-              Outstanding work no run has claimed, grouped by variant. Tap one
-              to start a run with it, then add more variants — including
-              products with no orders at all — in the builder.
-              {readyToShipPieces > 0 && (
+              Outstanding work no run has claimed, grouped by product. Tap one
+              to start a run with it, then add more products — including
+              products with no orders at all — in the builder. The big number
+              is what a run would make: <b>untriaged</b> pieces only.
+              {(inProductionPieces > 0 || readyToShipPieces > 0) && (
                 <>
                   {" "}
-                  Pieces already marked <b>Ready to ship</b> are left out of
-                  these counts: they exist, so there is nothing to make.
+                  Pieces already at a stage, or marked <b>Ready to ship</b>,
+                  are listed underneath but never counted there — that metal
+                  exists, so there is nothing to cast. Finish it on the
+                  tracker.
                 </>
               )}
             </p>
@@ -1382,6 +1387,15 @@ export default function BatchPage() {
                         to make · {c.lines.length}{" "}
                         {c.lines.length === 1 ? "order" : "orders"}
                       </span>
+                      {/* Pieces that already exist, in workshop order. Shown
+                          the same way as ready-to-ship because they mean the
+                          same thing to the reader: metal that is not this
+                          card's job to make. */}
+                      {c.stagePieces.map((s) => (
+                        <span key={s.stage} className="bt-cand-instage">
+                          {s.pieces} at {STAGE_LABELS[s.stage]}
+                        </span>
+                      ))}
                       {c.readyPieces > 0 && (
                         <span className="bt-cand-ready">
                           {c.readyPieces} ready to ship
@@ -3269,6 +3283,11 @@ const BATCH_CSS = `
 }
 .bt-cand-nums span { display: block; font-size: 10px; color: var(--color-neutral-600); }
 .bt-cand-ready { color: #1c6b3a !important; font-weight: 800; }
+/* Part-made pieces. Amber rather than the ready-to-ship green: this metal
+   exists but is not finished, and the card should not read as though it is.
+   Literal colours, like the green above — these two lines are a traffic
+   light and are meant to read the same in either theme. */
+.bt-cand-instage { color: #8a5a00 !important; font-weight: 800; }
 .bt-cand-go {
   display: inline-flex; align-items: center; gap: 5px; flex: none;
   font-family: var(--font-heading); font-weight: 800; font-size: 12px;

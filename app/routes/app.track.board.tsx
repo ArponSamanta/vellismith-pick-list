@@ -37,13 +37,23 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     const { lines, fetchedAt, cached } = await getBoard(admin, session.shop, {
       force,
     });
-    return { lines, fetchedAt, cached, error: null as string | null };
+    // The shop domain rides along so cards can link to the admin. It is
+    // already known here; sending it beats a second round trip for a string
+    // that never changes.
+    return {
+      lines,
+      fetchedAt,
+      cached,
+      shop: session.shop,
+      error: null as string | null,
+    };
   } catch (error) {
     console.error("[track] board loader error:", error);
     return {
       lines: [] as TrackedLine[],
       fetchedAt: null as string | null,
       cached: false,
+      shop: session.shop,
       error: "Couldn't load orders from Shopify. Please try again.",
     };
   }

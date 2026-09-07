@@ -39,6 +39,7 @@ const EMPTY: Omit<BatchPageData, "fetchedAt"> & { fetchedAt: string | null } = {
   candidates: [],
   suggestions: [],
   readyToShipPieces: 0,
+  inProductionPieces: 0,
   // Not "Run 01": on an error path we never read the existing runs, and
   // guessing a number that is probably already taken is worse than an empty
   // field the server will fill in correctly at save time.

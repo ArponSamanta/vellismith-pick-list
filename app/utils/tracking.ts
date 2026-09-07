@@ -187,3 +187,32 @@ export function columnFor(
   if (status === "IN_MANUFACTURE" && stage) return stage;
   return UNTRIAGED;
 }
+
+// ── Links back to Shopify ─────────────────────────────────────────────────
+
+/**
+ * A link to one order in the Shopify admin.
+ *
+ * Built as an ordinary https URL rather than App Bridge's `shopify://admin/…`
+ * scheme, because the board opens it in a NEW TAB. Losing your place in a
+ * six-hundred-card board to glance at one order is a bad trade — you come back
+ * to the top of the list with every column scrolled home.
+ *
+ * `shop` is the myshopify domain; admin.shopify.com addresses a store by the
+ * same handle with that suffix removed. Returns null rather than a broken link
+ * when either part isn't the shape we expect — an order id arriving as
+ * something other than a gid is a reason to render plain text, not to render
+ * an anchor that 404s.
+ */
+export function adminOrderUrl(
+  shop: string | null | undefined,
+  orderId: string | null | undefined
+): string | null {
+  const numeric = (orderId ?? "").split("/").pop() ?? "";
+  if (!/^\d+$/.test(numeric)) return null;
+
+  const handle = (shop ?? "").trim().replace(/\.myshopify\.com$/i, "");
+  if (!/^[a-z0-9][a-z0-9-]*$/i.test(handle)) return null;
+
+  return `https://admin.shopify.com/store/${handle}/orders/${numeric}`;
+}

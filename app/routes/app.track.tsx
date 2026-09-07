@@ -31,6 +31,7 @@ import {
   STAGE_LABELS,
   UNTRIAGED,
   NOTE_MAX,
+  adminOrderUrl,
   columnFor,
   formatPromisedDate,
   withinDateRange,
@@ -305,6 +306,8 @@ export default function TrackPage() {
   const lines = useMemo(() => board.data?.lines ?? [], [board.data]);
   const error = board.data?.error ?? null;
   const loadingBoard = board.state === "loading" || board.data === undefined;
+  /** Present on both loader paths, so order links survive a failed sweep. */
+  const shop = board.data?.shop ?? null;
 
   /**
    * Refresh forces a real Shopify read (?force=1), bypassing the cache.
@@ -817,7 +820,28 @@ export default function TrackPage() {
                                   buttons left no width for either date, so
                                   the promised one was truncating to "25 …". */}
                               <div className="tk-card-meta">
-                                <span className="tk-order">{line.orderName}</span>
+                                {/* The card itself opens the edit drawer, so
+                                    this has to stop the click travelling —
+                                    otherwise checking an order in Shopify also
+                                    pops the drawer behind it. Falls back to
+                                    plain text when the URL can't be built. */}
+                                {adminOrderUrl(shop, line.orderId) ? (
+                                  <a
+                                    className="tk-order tk-order-link"
+                                    href={adminOrderUrl(shop, line.orderId)!}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    title={`Open ${line.orderName} in Shopify admin`}
+                                    onClick={(e) => e.stopPropagation()}
+                                    onKeyDown={(e) => e.stopPropagation()}
+                                  >
+                                    {line.orderName}
+                                  </a>
+                                ) : (
+                                  <span className="tk-order">
+                                    {line.orderName}
+                                  </span>
+                                )}
                                 {line.promisedDate && (
                                   <span
                                     className="tk-due"
@@ -1242,6 +1266,18 @@ const TRACK_CSS = `
 }
 .tk-order {
   font-family: var(--font-heading); font-weight: 800; font-size: 11px;
+}
+/* Underlined only on hover: every card carries one, and a board of six hundred
+   permanently underlined order numbers reads as noise. The dotted rule keeps
+   it discoverable without shouting. */
+.tk-order-link {
+  color: inherit; text-decoration: none;
+  border-bottom: 1px dotted var(--color-neutral-600);
+  cursor: pointer;
+}
+.tk-order-link:hover,
+.tk-order-link:focus-visible {
+  color: var(--color-accent); border-bottom-color: var(--color-accent);
 }
 /* A workshop fact: when the piece was last touched. */
 .tk-age {

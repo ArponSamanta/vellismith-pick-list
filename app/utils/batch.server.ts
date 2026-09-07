@@ -203,9 +203,21 @@ export interface BatchCandidate {
   productTitle: string;
   productType: string;
   imageUrl: string | null;
-  /** Total pieces to make across every finish. Excludes ready-to-ship. */
+  /**
+   * Pieces a run could actually make: untriaged only.
+   *
+   * Anything already in a stage is counted in stagePieces instead, because a
+   * half-made piece is not work to start — see isClaimable.
+   */
   pieces: number;
   readyPieces: number;
+  /**
+   * Part-made pieces no run is carrying, by stage, in workshop order.
+   *
+   * Reported for the card, never claimable. Mostly the pre-batch backlog:
+   * work that moved through the tracker before runs existed.
+   */
+  stagePieces: Array<{ stage: TrackStage; pieces: number }>;
   variants: CandidateVariant[];
   lines: Array<{
     lineItemId: string;
@@ -242,6 +254,14 @@ export interface BatchPageData {
   /** Orders that could be filled from surplus without making anything new. */
   suggestions: AllocationSuggestion[];
   readyToShipPieces: number;
+  /**
+   * Part-made pieces sitting in a stage with no run carrying them.
+   *
+   * Overwhelmingly the pre-batch backlog. Surfaced on the "Still to make"
+   * tile so the headline number can stay honest — these are neither work to
+   * start nor finished stock, and counting them as either was the bug.
+   */
+  inProductionPieces: number;
   /** What the builder should pre-fill as the next run's name. */
   nextRunName: string;
   fetchedAt: string;
@@ -291,6 +311,9 @@ export async function getBatchPage(
     candidates,
     suggestions: planAllocation(batches, candidates),
     readyToShipPieces: candidates.reduce((sum, c) => sum + c.readyPieces, 0),
+    // Counted from the board, not from candidates: a product whose every
+    // piece is part-made has no candidate row to carry the number.
+    inProductionPieces: inProductionTotal(lines, claimed),
     nextRunName: await nextRunName(shop),
     fetchedAt,
     cached,
@@ -441,6 +464,11 @@ export async function autoAllocate(params: {
     const batch = byBatch.get(suggestion.batchId);
     if (!line || !batch) continue;
 
+    // Re-checked per line, not once for the set: this loop writes as it goes,
+    // so a later suggestion is being applied against a database the earlier
+    // ones have already changed.
+    await assertUnclaimed({ shop: params.shop, lineItemIds: [line.lineItemId] });
+
     await db.batchItem.createMany({
       data: [
         {
@@ -483,9 +511,22 @@ export async function loadRoutes(shop: string): Promise<RouteMap> {
   return new Map(rows.map((r) => [r.variantId, r.skipStages]));
 }
 
-/** A line that still needs manufacturing — i.e. is not already finished. */
-export function needsMaking(line: { column: BoardColumn }): boolean {
-  return line.column !== "READY_TO_SHIP";
+/**
+ * A line a run may claim: one where nothing has been made yet.
+ *
+ * Untriaged ONLY, which is narrower than it first looks. A line sitting at
+ * Polishing is not work to be made — the metal exists, somebody cast it, and
+ * offering it as a batch candidate asks the workshop to cast it a second time.
+ * That is how the pre-batch backlog read on this page: 150 part-finished
+ * pieces counted as 150 still to make.
+ *
+ * So started work is reported, never claimed. It is finished on the tracker,
+ * where it already lives. A run that is cancelled returns its lines to
+ * Untriaged (see releaseLines), which is exactly what makes them claimable
+ * again — the two rules agree without either knowing about the other.
+ */
+export function isClaimable(line: { column: BoardColumn }): boolean {
+  return line.column === UNTRIAGED;
 }
 
 function buildCandidates(
@@ -494,6 +535,7 @@ function buildCandidates(
 ): BatchCandidate[] {
   const groups = new Map<string, BatchCandidate>();
   const variantTally = new Map<string, Map<string, CandidateVariant>>();
+  const stageTally = new Map<string, Map<TrackStage, number>>();
 
   for (const line of lines) {
     if (claimed.has(line.lineItemId)) continue;
@@ -507,17 +549,29 @@ function buildCandidates(
         imageUrl: line.imageUrl,
         pieces: 0,
         readyPieces: 0,
+        stagePieces: [],
         variants: [],
         lines: [],
         earliestPromised: null,
       };
       groups.set(line.productId, group);
       variantTally.set(line.productId, new Map());
+      stageTally.set(line.productId, new Map());
     }
 
     // Already finished: the piece exists, so it is not work to be made.
-    if (!needsMaking(line)) {
+    if (line.column === "READY_TO_SHIP") {
       group.readyPieces += line.quantity;
+      continue;
+    }
+
+    // Part-made and outside any run. Reported so the number is visible, but
+    // deliberately not counted as work to make and not offered to a run —
+    // see isClaimable.
+    if (!isClaimable(line)) {
+      const stages = stageTally.get(line.productId)!;
+      const stage = line.column as TrackStage;
+      stages.set(stage, (stages.get(stage) ?? 0) + line.quantity);
       continue;
     }
 
@@ -559,9 +613,34 @@ function buildCandidates(
     }
   }
 
+  // Workshop order, not size order: the card reads as a pipeline, so "3 at
+  // Setting · 7 at Plating" should always run in the direction work flows.
+  for (const [productId, stages] of stageTally) {
+    const group = groups.get(productId);
+    if (group) {
+      group.stagePieces = STAGES.filter((s) => (stages.get(s) ?? 0) > 0).map(
+        (stage) => ({ stage, pieces: stages.get(stage)! })
+      );
+    }
+  }
+
+  // Still gated on work to make. A product with nothing untriaged is not
+  // "ready to batch" however many part-made pieces it has — those are
+  // finished on the tracker, and the page-level total reports them.
   return [...groups.values()]
     .filter((g) => g.pieces > 0)
     .sort((a, b) => b.pieces - a.pieces);
+}
+
+/** Part-made pieces outside any run, across every product. */
+function inProductionTotal(lines: TrackedLine[], claimed: Set<string>): number {
+  let total = 0;
+  for (const line of lines) {
+    if (claimed.has(line.lineItemId)) continue;
+    if (line.column === "READY_TO_SHIP" || isClaimable(line)) continue;
+    total += line.quantity;
+  }
+  return total;
 }
 
 type BatchRow = Awaited<
@@ -882,12 +961,15 @@ async function prepareProducts(params: {
   const board = await getBoard(admin, shop);
   const claimedIds = await claimedLineIds(shop);
 
+  // Must agree with buildCandidates exactly: the card offers untriaged pieces,
+  // so the run has to claim untriaged pieces. If this filter were any wider,
+  // a card reading "4 to make" would silently start a run committed to 15.
   const linesFor = (productId: string) =>
     board.lines.filter(
       (l) =>
         l.productId === productId &&
         !claimedIds.has(l.lineItemId) &&
-        needsMaking(l)
+        isClaimable(l)
     );
 
   // Only products with nothing outstanding need a catalogue lookup, so a run
@@ -897,6 +979,13 @@ async function prepareProducts(params: {
     .map((s) => s.productId);
   const catalogue =
     needLookup.length > 0 ? await fetchVariants(admin, needLookup) : new Map();
+
+  await assertUnclaimed({
+    shop,
+    lineItemIds: selections.flatMap((s) =>
+      linesFor(s.productId).map((l) => l.lineItemId)
+    ),
+  });
 
   return selections.map((selection) => {
     const lines = linesFor(selection.productId);
@@ -997,6 +1086,54 @@ async function claimedLineIds(shop: string): Promise<Set<string>> {
     select: { lineItemId: true },
   });
   return new Set(rows.map((r) => r.lineItemId));
+}
+
+/**
+ * Refuse to claim an order line a live run already holds.
+ *
+ * Every path that adds lines filters on claimedLineIds first, but a filter
+ * built when the page loaded can be stale by the time the form is submitted —
+ * and the unique index is per batch-product, so nothing at the database level
+ * stops the same line landing in two different runs. Two runs both promising
+ * the same customer's ring is the one inconsistency this model cannot detect
+ * afterwards: the piece ships once and the other run looks fulfilled.
+ *
+ * So the check is repeated immediately before the write, and names the run
+ * holding the line rather than failing anonymously. This narrows the window to
+ * the gap between the check and the insert rather than closing it outright;
+ * a partial unique index on live claims would close it, at the cost of a
+ * denormalised flag maintained on every status change. For one workshop with
+ * one person clicking, the re-check is the proportionate half.
+ *
+ * Callers pass lines that have already survived a claimedLineIds filter, so
+ * the claiming run's own items can never appear here — any hit is a genuine
+ * clash with another run, and needs no exception for self.
+ */
+async function assertUnclaimed(params: {
+  shop: string;
+  lineItemIds: string[];
+}): Promise<void> {
+  if (params.lineItemIds.length === 0) return;
+
+  const clash = await db.batchItem.findFirst({
+    where: {
+      lineItemId: { in: params.lineItemIds },
+      batchProduct: {
+        batch: { shop: params.shop, status: { in: CLAIMING_STATUSES } },
+      },
+    },
+    select: {
+      orderName: true,
+      batchProduct: { select: { batch: { select: { name: true } } } },
+    },
+  });
+
+  if (clash) {
+    throw new BatchError(
+      `${clash.orderName} is already in ${clash.batchProduct.batch.name}. ` +
+        `Remove it from that run first, or refresh to see the current lists.`
+    );
+  }
 }
 
 // ── The plating handler ───────────────────────────────────────────────────
@@ -1303,7 +1440,7 @@ export async function addUnclaimedLines(params: {
     (l) =>
       l.productId === product.productId &&
       !claimedIds.has(l.lineItemId) &&
-      needsMaking(l)
+      isClaimable(l)
   );
   if (fresh.length === 0) {
     throw new BatchError("There are no new orders to make for that product.");
@@ -1332,6 +1469,11 @@ export async function addUnclaimedLines(params: {
       `This run has no spare pieces of ${product.productTitle}. Start another run.`
     );
   }
+
+  await assertUnclaimed({
+    shop: params.shop,
+    lineItemIds: affordable.map((l) => l.lineItemId),
+  });
 
   await db.batchItem.createMany({
     data: affordable.map((l) => ({
