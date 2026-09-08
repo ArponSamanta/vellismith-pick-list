@@ -489,8 +489,37 @@ function positionLabel(batch: BatchView): string {
  * time; see handlePrint for why it can't simply call window.print().
  */
 function RunSheet({ batch }: { batch: BatchView }) {
+  /**
+   * What this sheet is for: the pieces that actually reach the run's current
+   * stage.
+   *
+   * A silver piece never goes to plating, so a plating sheet that prints the
+   * raw casting number asks the plater for ten when nine are coming, and lists
+   * a finish that will never arrive. The bench counts what is on the tray
+   * against what is on the paper, so that discrepancy reads as a lost piece.
+   *
+   * Before the run starts there is no stage to filter by and the sheet is the
+   * casting list, which is the raw number and every finish.
+   */
+  const stage = batch.stage;
+  const sheet = batch.products
+    .map((product) => {
+      const finishes = stage
+        ? product.finishes.filter((f) => !f.skipStages.includes(stage))
+        : product.finishes;
+      return {
+        product,
+        finishes,
+        quantity: stage
+          ? finishes.reduce((sum, f) => sum + f.quantity, 0)
+          : product.plannedQuantity,
+      };
+    })
+    // A product with nothing reaching this stage is not this sheet's work.
+    .filter((entry) => entry.quantity > 0);
+
   // Four to a row, matching the pick list grid.
-  const rows = Math.ceil(batch.products.length / 4);
+  const rows = Math.ceil(sheet.length / 4);
 
   return (
     <div id="batch-print">
@@ -504,31 +533,36 @@ function RunSheet({ batch }: { batch: BatchView }) {
           {Array.from({ length: rows }).map((_, rowIndex) => (
             <tr key={rowIndex}>
               {[0, 1, 2, 3].map((colIndex) => {
-                const product = batch.products[rowIndex * 4 + colIndex];
+                const entry = sheet[rowIndex * 4 + colIndex];
                 return (
                   <td key={colIndex}>
-                    {product && (
+                    {entry && (
                       <div className="bpc">
-                        {shopifyImg(product.imageUrl, PRINT_IMG_WIDTH) ? (
+                        {shopifyImg(entry.product.imageUrl, PRINT_IMG_WIDTH) ? (
                           <img
-                            src={shopifyImg(product.imageUrl, PRINT_IMG_WIDTH)!}
-                            alt={product.productTitle}
+                            src={
+                              shopifyImg(entry.product.imageUrl, PRINT_IMG_WIDTH)!
+                            }
+                            alt={entry.product.productTitle}
                           />
                         ) : (
                           <div className="bpc-noimg">No image</div>
                         )}
                         <div className="bpc-body">
-                          <div className="bpc-title">{product.productTitle}</div>
+                          <div className="bpc-title">
+                            {entry.product.productTitle}
+                          </div>
                           <div className="bpc-vars">
-                            {product.finishes.map((finish) => (
+                            {entry.finishes.map((finish) => (
                               <div key={finish.id} className="bpc-var-row">
                                 {finish.variantTitle || "—"}: <b>{finish.quantity}</b>
                               </div>
                             ))}
                           </div>
-                          {/* The raw count — what actually gets cast. The
-                              finishes above are how it will be split later. */}
-                          <div className="bpc-qty">{product.plannedQuantity}</div>
+                          {/* Pieces reaching THIS stage. Before the run starts
+                              that is the whole casting number; at plating it
+                              excludes anything that skips it. */}
+                          <div className="bpc-qty">{entry.quantity}</div>
                         </div>
                       </div>
                     )}
@@ -722,6 +756,15 @@ export default function BatchPage() {
   const batches = useMemo(() => data.data?.batches ?? [], [data.data]);
   const candidates = useMemo(() => data.data?.candidates ?? [], [data.data]);
   const suggestions = useMemo(() => data.data?.suggestions ?? [], [data.data]);
+  /** Fillable right now, versus surplus sitting in a run making something else. */
+  const addableSuggestions = useMemo(
+    () => suggestions.filter((s) => s.addable),
+    [suggestions]
+  );
+  const blockedSuggestions = useMemo(
+    () => suggestions.filter((s) => !s.addable),
+    [suggestions]
+  );
   const readyToShipPieces = data.data?.readyToShipPieces ?? 0;
   const inProductionPieces = data.data?.inProductionPieces ?? 0;
   const nextRunName = data.data?.nextRunName ?? "";
@@ -1057,18 +1100,27 @@ export default function BatchPage() {
     const ordered = new Map(p.demand.map((d) => [d.variantId, d.pieces]));
     const catalogue = variantsByProduct.get(p.productId) ?? [];
 
-    const rows =
-      catalogue.length > 0
-        ? catalogue.map((v) => ({
-            variantId: v.variantId,
-            variantTitle: v.variantTitle,
-            pieces: ordered.get(v.variantId) ?? 0,
-          }))
-        : p.demand.map((d) => ({
-            variantId: d.variantId,
-            variantTitle: d.variantTitle,
-            pieces: d.pieces,
-          }));
+    // A union, not a replacement. The catalogue query returns one page, so a
+    // product with more variants than that page holds — or a variant deleted
+    // from the product but still sitting on an open order — would lose its
+    // chip the moment the list loaded. A chip that isn't there can't be
+    // ticked, which would silently drop those orders from the run: the same
+    // failure as offering no chip at all, arrived at from the other side.
+    const rows = catalogue.map((v) => ({
+      variantId: v.variantId,
+      variantTitle: v.variantTitle,
+      pieces: ordered.get(v.variantId) ?? 0,
+    }));
+
+    const listed = new Set(rows.map((r) => r.variantId));
+    for (const d of p.demand) {
+      if (listed.has(d.variantId)) continue;
+      rows.push({
+        variantId: d.variantId,
+        variantTitle: d.variantTitle,
+        pieces: d.pieces,
+      });
+    }
 
     return rows.sort(
       (a, b) =>
@@ -1432,10 +1484,28 @@ export default function BatchPage() {
           {suggestions.length > 0 && (
             <div className="bt-suggest">
               <div className="bt-suggest-head">
+                {/* Two different facts, and conflating them would be the lie:
+                    some of these orders can be filled right now, and some name
+                    a run that HAS the pieces but is making another variant.
+                    The second kind is here to be seen, not actioned. */}
                 <span>
-                  <b>{suggestions.length}</b>{" "}
-                  {suggestions.length === 1 ? "order can" : "orders can"} be
-                  filled from surplus — nothing new to make
+                  {addableSuggestions.length > 0 && (
+                    <>
+                      <b>{addableSuggestions.length}</b>{" "}
+                      {addableSuggestions.length === 1
+                        ? "order can"
+                        : "orders can"}{" "}
+                      be filled from surplus — nothing new to make.
+                    </>
+                  )}
+                  {blockedSuggestions.length > 0 && (
+                    <>
+                      {addableSuggestions.length > 0 ? " " : ""}
+                      <b>{blockedSuggestions.length}</b>{" "}
+                      {blockedSuggestions.length === 1 ? "order has" : "orders have"}{" "}
+                      spare pieces in a run making a different variant.
+                    </>
+                  )}
                 </span>
                 <span className="bt-suggest-acts">
                   <button
@@ -1444,19 +1514,27 @@ export default function BatchPage() {
                   >
                     {showSuggestions ? "Hide" : "Review"}
                   </button>
-                  <button
-                    className="btn btn-primary"
-                    disabled={busy}
-                    onClick={() => submit({ intent: "auto-allocate" })}
-                  >
-                    {busy ? "Allocating…" : "Allocate all"}
-                  </button>
+                  {addableSuggestions.length > 0 && (
+                    <button
+                      className="btn btn-primary"
+                      disabled={busy}
+                      onClick={() => submit({ intent: "auto-allocate" })}
+                    >
+                      {busy
+                        ? "Allocating…"
+                        : `Allocate ${addableSuggestions.length}`}
+                    </button>
+                  )}
                 </span>
               </div>
               {showSuggestions && (
                 <div className="bt-suggest-list">
                   {suggestions.map((s) => (
-                    <div key={s.lineItemId} className="bt-suggest-row">
+                    <div
+                      key={s.lineItemId}
+                      className="bt-suggest-row"
+                      data-blocked={!s.addable}
+                    >
                       <span className="bt-suggest-order">{s.orderName}</span>
                       <span className="bt-suggest-what">
                         {s.productTitle}
@@ -1466,10 +1544,15 @@ export default function BatchPage() {
                           ? ` · due ${formatPromisedDate(s.promisedDate)}`
                           : ""}
                       </span>
+                      {/* A blocked row names the run so the merchant can go
+                          and widen its scope, which is the actual next step —
+                          "→" would imply it is going there. */}
                       <span className="bt-suggest-to">
-                        → {s.batchName} (
+                        {s.addable ? "→ " : "blocked · "}
+                        {s.batchName} (
                         {s.batchStage ? STAGE_LABELS[s.batchStage] : "not started"}
-                        , {s.spareAfter} left)
+                        , {s.spareAfter} spare)
+                        {s.addable ? "" : " — run is making another variant"}
                       </span>
                     </div>
                   ))}
@@ -3323,6 +3406,11 @@ const BATCH_CSS = `
 .bt-suggest-order { font-family: var(--font-heading); font-weight: 800; min-width: 56px; }
 .bt-suggest-what { flex: 1 1 auto; }
 .bt-suggest-to { font-family: var(--font-heading); font-weight: 800; }
+/* Informational, not actionable. Amber rather than the panel's green, and
+   dimmed, so a scan of the list separates "will happen" from "exists, but
+   not for this order". */
+.bt-suggest-row[data-blocked="true"] { opacity: .75; }
+.bt-suggest-row[data-blocked="true"] .bt-suggest-to { color: #8a5a00; }
 
 .bt-warn-inline {
   display: flex; align-items: center; justify-content: space-between;

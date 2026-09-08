@@ -116,6 +116,14 @@ export interface FinishView {
   committed: number;
   /** Stages this finish still has to go through after the split. */
   remainingStages: TrackStage[];
+  /**
+   * Stages this variant's route skips entirely — silver never being plated.
+   *
+   * remainingStages only covers the split stage onward, so it can't answer
+   * "does this finish pass through Setting?". The run sheet has to, because a
+   * sheet printed for one stage must not list pieces that never reach it.
+   */
+  skipStages: TrackStage[];
   /** True when it is finished as soon as the run reaches the split stage. */
   doneAtSplit: boolean;
   inventoryDelta: number | null;
@@ -258,6 +266,14 @@ export interface AllocationSuggestion {
   batchStage: TrackStage | null;
   /** Spare pieces left in that run once this order is taken. */
   spareAfter: number;
+  /**
+   * False when the run holds the pieces but is scoped to a different variant.
+   *
+   * Reported rather than hidden: the merchant wants to know the surplus is
+   * there. The add is still refused — a run making clip-ons is not quietly
+   * turned into one making pierced because an order arrived.
+   */
+  addable: boolean;
 }
 
 export interface BatchPageData {
@@ -394,17 +410,42 @@ function planAllocation(
     );
 
     for (const line of lines) {
+      /**
+       * A run holding enough spare of this PRODUCT whose scope excludes this
+       * variant.
+       *
+       * Remembered rather than skipped silently. The merchant asked to be told
+       * that the pieces exist even when the run can't take the order — knowing
+       * there is a tray of raw metal one decision away is what lets them widen
+       * that run's scope or start a small one, where silence just looks like
+       * there is nothing to make it from. Only reported if nothing else can
+       * actually fill the line.
+       */
+      let blocked: { batch: BatchView; spare: number } | null = null;
+      let placed = false;
+
       for (const batch of open) {
         const product = batch.products.find(
           (p) => p.productId === candidate.productId
         );
         if (!product) continue;
-        // A narrowed run is only offered the variants it is making.
-        if (!inScope(product.variantIds, line.variantId)) continue;
 
         // Before the split, spare is raw and any finish may draw on it. After
         // it, the pieces are already committed to a finish.
-        const split = Boolean(product.splitDecidedAt);
+        //
+        // "After" means the run has physically REACHED the split stage, not
+        // that somebody pressed Change split. That button isn't stage-gated,
+        // so an allocation can be adjusted at Casting — and until the metal
+        // arrives at plating it is still undifferentiated, so a new order for
+        // a fully-allocated finish can still be served by re-splitting. Going
+        // on the flag alone made an early adjustment silently freeze the run
+        // out of taking any more work for that finish.
+        const atOrPastSplit =
+          product.splitStage !== null &&
+          batch.stage !== null &&
+          STAGES.indexOf(batch.stage) >=
+            STAGES.indexOf(product.splitStage);
+        const split = atOrPastSplit && Boolean(product.splitDecidedAt);
         const key = split
           ? `${batch.id}:${product.id}:${line.variantId}`
           : `${batch.id}:${product.id}`;
@@ -414,6 +455,13 @@ function planAllocation(
         // A line is taken whole or not at all — a BatchItem can't hold half
         // an order.
         if (spare < line.quantity) continue;
+
+        // The pieces are there but this run is making something else. Note it
+        // and keep looking for a run that can genuinely take the order.
+        if (!inScope(product.variantIds, line.variantId)) {
+          blocked ??= { batch, spare };
+          continue;
+        }
 
         pool.set(key, spare - line.quantity);
         // The product-level figure has to fall too, or a later unsplit match
@@ -440,8 +488,35 @@ function planAllocation(
           batchProductId: product.id,
           batchStage: batch.stage,
           spareAfter: pool.get(key) ?? 0,
+          addable: true,
         });
+        placed = true;
         break; // this line is spoken for
+      }
+
+      // Nothing could take it, but a narrowed run has the metal. Report it so
+      // the surplus is visible; the add stays refused because the run is
+      // making a different variant.
+      if (!placed && blocked) {
+        suggestions.push({
+          lineItemId: line.lineItemId,
+          orderName: line.orderName,
+          quantity: line.quantity,
+          productTitle: candidate.productTitle,
+          variantTitle:
+            candidate.variants.find((v) => v.variantId === line.variantId)
+              ?.variantTitle ?? "",
+          promisedDate: line.promisedDate,
+          batchId: blocked.batch.id,
+          batchName: blocked.batch.name,
+          batchProductId:
+            blocked.batch.products.find(
+              (p) => p.productId === candidate.productId
+            )?.id ?? "",
+          batchStage: blocked.batch.stage,
+          spareAfter: blocked.spare,
+          addable: false,
+        });
       }
     }
   }
@@ -463,7 +538,11 @@ export async function autoAllocate(params: {
   by?: string | null;
 }): Promise<number> {
   const page = await getBatchPage(params.admin, params.shop);
-  if (page.suggestions.length === 0) return 0;
+  // Blocked ones are in the list to be SEEN, not to be applied. Allocating
+  // them would put an order into a run scoped away from its variant, which is
+  // the whole thing the scope exists to prevent.
+  const plan = page.suggestions.filter((s) => s.addable);
+  if (plan.length === 0) return 0;
 
   const [board, routes] = await Promise.all([
     getBoard(params.admin, params.shop),
@@ -473,7 +552,7 @@ export async function autoAllocate(params: {
   const byBatch = new Map(page.batches.map((b) => [b.id, b]));
 
   let applied = 0;
-  for (const suggestion of page.suggestions) {
+  for (const suggestion of plan) {
     const line = byLineItem.get(suggestion.lineItemId);
     const batch = byBatch.get(suggestion.batchId);
     if (!line || !batch) continue;
@@ -753,6 +832,7 @@ function toBatchView(
         quantity: finish.quantity,
         committed: demand.get(finish.variantId) ?? 0,
         remainingStages: remaining,
+        skipStages: STAGES.filter((s) => skip.includes(s)),
         doneAtSplit: remaining.length === 0,
         inventoryDelta: finish.inventoryDelta,
       };
@@ -1135,7 +1215,14 @@ async function prepareProducts(params: {
           raw,
           (selection.variantIds ?? [])
             .map((id) => catalogue.get(id))
-            .filter((v): v is CatalogVariant => Boolean(v))
+            // Belongs to THIS product. The scope arrives from a form, and a
+            // variant id from somewhere else would otherwise be written as a
+            // finish of a product it has nothing to do with — and later
+            // allocated pieces, and posted to that variant's stock.
+            .filter(
+              (v): v is CatalogVariant =>
+                Boolean(v) && v!.productId === selection.productId
+            )
         ),
       },
     };
