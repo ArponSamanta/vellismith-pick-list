@@ -61,6 +61,7 @@ import {
   nextBatchStep,
   prevBatchStep,
   surplusOf,
+  variantPosition,
 } from "../utils/batching";
 import {
   COLUMN_LABELS,
@@ -697,14 +698,28 @@ function scopeLabel(product: BatchProductView): string {
  * "plating", so a product that splits somewhere else still reads correctly.
  */
 function routeWords(opts: {
+  /**
+   * Nothing left to do to this finish AT ALL, from where the run stands.
+   *
+   * Checked first and kept separate from doneAtSplit, which only means
+   * "nothing at or after the split stage". Those are not the same thing: a
+   * silver finish that skips plating is doneAtSplit from the moment the run is
+   * created, while casting, workshop, setting and polishing are all still
+   * ahead of it. Reading the two as one claimed "no further stages" on a run
+   * that had barely started.
+   */
+  finished: boolean;
   doneAtSplit: boolean;
   remaining: readonly TrackStage[];
   splitStage: TrackStage | null;
-  /** True once the split has actually been made, which changes the tense. */
-  decided: boolean;
+  /** True once the run has reached the split stage, which changes the tense. */
+  reachedSplit: boolean;
 }): string {
+  if (opts.finished) return "no further stages";
+
   if (opts.doneAtSplit) {
-    if (opts.decided) return "no further stages";
+    // Unreachable second branch in practice — a product always splits
+    // somewhere, and one that did not would have been caught by `finished`.
     return opts.splitStage
       ? `does not require ${STAGE_LABELS[opts.splitStage].toLowerCase()}`
       : "no further stages";
@@ -713,15 +728,37 @@ function routeWords(opts: {
   const stages = opts.remaining
     .map((s) => STAGE_LABELS[s].toLowerCase())
     .join(" → ");
-  return opts.decided ? `still requires ${stages}` : `needs ${stages}`;
+  return opts.reachedSplit ? `still requires ${stages}` : `needs ${stages}`;
 }
 
-function finishRoute(product: BatchProductView, finish: FinishView): string {
+function finishRoute(
+  batch: BatchView,
+  product: BatchProductView,
+  finish: FinishView
+): string {
+  // "Finished" is not a second opinion — it is exactly where the pieces are.
+  // variantPosition already answers "has this variant any stage left, from
+  // where the run stands", and reusing it means the sentence can never
+  // disagree with the column the pieces are sitting in.
+  const finished =
+    variantPosition(batch.stage, batch.status, finish.skipStages) ===
+    "READY_TO_SHIP";
+
+  // The tense turns on whether the run has REACHED the split stage, not on
+  // whether somebody pressed Change split. Reaching it is what makes the
+  // outcome a fact: pieces get allocated, and a finish that skips the stage is
+  // done. An early decision does not make a piece at casting finished.
+  const reachedSplit =
+    product.splitStage !== null &&
+    batch.stage !== null &&
+    STAGES.indexOf(batch.stage) >= STAGES.indexOf(product.splitStage);
+
   return routeWords({
+    finished,
     doneAtSplit: finish.doneAtSplit,
     remaining: finish.remainingStages,
     splitStage: product.splitStage,
-    decided: Boolean(product.splitDecidedAt),
+    reachedSplit,
   });
 }
 
@@ -2188,16 +2225,19 @@ export default function BatchPage() {
                         </span>
                         <span className="bt-pick-sub">
                           {owed > 0 ? `${owed} on order · ` : ""}
-                          {/* Always the undecided tense here: this dialog IS
+                          {/* Always the pre-split tense here: this dialog IS
                               the decision, so it reads "needs / does not
                               require", and the run's own list switches to
-                              "still requires / no further stages" once it has
-                              been made. */}
+                              "still requires / no further stages" once the run
+                              reaches the stage. Nothing is finished from this
+                              dialog's point of view — it is allocating pieces
+                              that still have the split ahead of them. */}
                           {routeWords({
+                            finished: false,
                             doneAtSplit: option.doneAtSplit,
                             remaining: option.remaining,
                             splitStage: splitting.product.splitStage,
-                            decided: false,
+                            reachedSplit: false,
                           })}
                         </span>
                       </span>
@@ -2967,16 +3007,21 @@ function ProductRow({
         </div>
       </div>
 
-      {/* The split. Prompted when the run reaches the plating stage, and
-          blocking the stock write until the numbers add up. */}
+      {/* Two reasons to prompt, and they read differently. Either the run has
+          arrived at the split stage and nobody has allocated yet, or an order
+          turned up for a finish with no pieces set aside while another finish
+          is holding spare — which is fixable at any stage, and cheapest before
+          the metal is committed. Saying "the run has reached Plating" on a run
+          sitting at Workshop was simply untrue. */}
       {product.splitDue && (
         <div className="bt-warn-box bt-warn-inline">
           <span>
-            The run has reached {STAGE_LABELS[product.splitStage ?? "PLATING"]}.
-            Decide how many of the {product.made} pieces get each finish.
+            {product.misallocated
+              ? `An order is waiting on a finish with no pieces set aside, while another has spare. Move ${product.made === 1 ? "the piece" : "pieces"} across.`
+              : `The run has reached ${STAGE_LABELS[product.splitStage ?? "PLATING"]}. Decide how many of the ${product.made} pieces get each finish.`}
           </span>
           <button className="bt-mini" disabled={busy} onClick={onSplit}>
-            Set finishes
+            {product.misallocated ? "Change split" : "Set finishes"}
           </button>
         </div>
       )}
@@ -3046,7 +3091,7 @@ function ProductRow({
                 <span className="bt-finish-qty">{finish.quantity}</span>
                 <span className="bt-finish-state">
                   {finish.committed > 0 ? `${finish.committed} on order · ` : ""}
-                  {finishRoute(product, finish)}
+                  {finishRoute(batch, product, finish)}
                 </span>
                 {finish.inventoryDelta !== null && (
                   <span className="bt-finish-done">

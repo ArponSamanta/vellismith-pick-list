@@ -167,15 +167,26 @@ export function neededStages(
 /**
  * Where a variant's pieces sit, given where the RUN is.
  *
- * The run has one position; each variant derives its own from it. Four cases,
- * and they are the whole of the skipped-stage behaviour:
+ * The run has one position; each variant derives its own from it. The rule is
+ * a single question — what is the next stage this variant still needs, from
+ * where the run has got to? — and everything else falls out of it:
  *
  *   • the run is at a stage this variant needs → the pieces are at that stage
- *   • the run hasn't reached this variant's first stage yet → untriaged
- *   • the run is past a stage this variant skips but it has more to come →
- *     the pieces WAIT at the last stage they actually had
+ *   • the run is at a stage it skips → the pieces are already queued at the
+ *     next stage they DO need. A plain band that needs no setting moves
+ *     Workshop → Polishing the moment the run starts setting, because a board
+ *     column means "waiting for this", and it is not waiting for workshop any
+ *     more.
  *   • nothing required remains → finished and ready to ship, even though the
  *     run itself is still going
+ *
+ * They used to WAIT at the last stage they actually had, which read as
+ * "queued for workshop" long after workshop was done with them, and left
+ * nothing to distinguish a piece held up at workshop from one that had sailed
+ * through it.
+ *
+ * A variant needing no stages at all is ready the moment the run starts: it is
+ * assembled from parts on hand, or bought in.
  */
 export function variantPosition(
   batchStage: TrackStage | null,
@@ -185,21 +196,9 @@ export function variantPosition(
   if (status === "MADE" || status === "CLOSED") return "READY_TO_SHIP";
   if (!batchStage) return UNTRIAGED;
 
-  const required = requiredStages(skip);
-  // A variant needing no stages at all is finished the moment the run starts:
-  // it is assembled from parts already on hand, or bought in.
-  if (required.length === 0) return "READY_TO_SHIP";
-
   const at = STAGES.indexOf(batchStage);
-  const done = required.filter((s) => STAGES.indexOf(s) <= at);
-  if (done.length === 0) return UNTRIAGED; // its first stage is still ahead
-
-  const last = done[done.length - 1];
-  if (last === batchStage) return batchStage; // being worked right now
-
-  // Between stages: waiting for its next one, or finished if it has none.
-  const more = required.some((s) => STAGES.indexOf(s) > at);
-  return more ? last : "READY_TO_SHIP";
+  const next = requiredStages(skip).find((s) => STAGES.indexOf(s) >= at);
+  return next ?? "READY_TO_SHIP";
 }
 
 /**

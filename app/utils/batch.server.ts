@@ -160,6 +160,14 @@ export interface BatchProductView {
   splitDecidedAt: string | null;
   /** The run has reached the split stage and nobody has allocated yet. */
   splitDue: boolean;
+  /**
+   * Pieces are on the wrong finishes: something is owed more than it holds
+   * while something else holds more than it owes.
+   *
+   * Separate from splitDue because it reads differently — this is "move them
+   * across", not "time to decide" — and because it is true at any stage.
+   */
+  misallocated: boolean;
 
   finishes: FinishView[];
   lines: BatchLineView[];
@@ -844,6 +852,17 @@ function toBatchView(
       (status === "MADE" ||
         (stage !== null && STAGES.indexOf(stage) >= STAGES.indexOf(splitStage)));
 
+    // Somebody is owed more of a finish than it holds. Driven off demand
+    // rather than the finish rows, because the worst case is a variant with
+    // orders and no row at all — iterating the rows would never look at it.
+    const someFinishShort = [...demand.entries()].some(
+      ([variantId, owed]) =>
+        owed > (finishes.find((f) => f.variantId === variantId)?.quantity ?? 0)
+    );
+    // And somewhere there are pieces not spoken for, which is what makes the
+    // shortfall fixable by moving them.
+    const someFinishSpare = finishes.some((f) => f.quantity > f.committed);
+
     return {
       id: product.id,
       productId: product.productId,
@@ -870,14 +889,23 @@ function toBatchView(
       // case is a variant with orders and NO row at all — a silver order
       // absorbed into an all-gold run. Iterating the rows would never look at
       // it, which is precisely how it stayed invisible.
+      // Staleness is NOT gated on reaching the split stage. An order arriving
+      // at Workshop for a finish with no pieces set aside is stale right then,
+      // and the metal is still raw, so re-splitting is the cheapest it will
+      // ever be. Waiting until Plating to mention it was flying blind for the
+      // whole middle of the run.
+      //
+      // Both halves are required: some finish is owed more than it holds, AND
+      // some other finish is holding more than it owes. That pairing is what
+      // makes it a MISALLOCATION rather than a shortfall — a run that simply
+      // makes too few has nothing to move, and prompting for a split it cannot
+      // fix would be noise on top of the shortfall it already reports.
+      misallocated: someFinishShort && someFinishSpare,
       splitDue:
-        reachedSplit &&
-        ((!product.splitDecidedAt && product.finishes.length > 1) ||
-          [...demand.entries()].some(
-            ([variantId, owed]) =>
-              owed >
-              (finishes.find((f) => f.variantId === variantId)?.quantity ?? 0)
-          )),
+        (someFinishShort && someFinishSpare) ||
+        (reachedSplit &&
+          !product.splitDecidedAt &&
+          product.finishes.length > 1),
       finishes,
       lines,
       scraps: product.scraps
