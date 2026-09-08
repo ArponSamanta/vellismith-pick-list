@@ -1285,15 +1285,20 @@ function seedFinishes(
   const committed = finishes.reduce((sum, f) => sum + f.qty, 0);
 
   // Under-planned: fewer pieces than orders. Hand them out in demand order
-  // until they run out, and create no row for a finish that gets none — a
-  // finish holding zero pieces is not a finish, and it would render as a
-  // blank line on the run, the sheet and the stock dialog.
+  // until they run out.
   //
   // The invariant this protects is that the finishes sum to EXACTLY the
   // planned quantity. Giving every finish its full demand here would have the
   // run claiming more pieces than it makes, and the stock write adds
   // finish.quantity — so the difference would land in Shopify as inventory
   // that does not exist.
+  //
+  // A finish that gets NOTHING still keeps its row when somebody is owed it.
+  // "Zero pieces is not a finish" holds for a variant nobody ordered; for one
+  // with orders this run can't fill, the zero IS the shortfall, stated per
+  // finish. Dropping it made a run of five against thirteen show a single
+  // finish while quietly holding all thirteen order lines — the two variants
+  // it couldn't cover disappeared from the run entirely.
   if (raw < committed) {
     const short: Array<{
       variantId: string;
@@ -1305,10 +1310,8 @@ function seedFinishes(
     for (const f of finishes) {
       const take = Math.max(0, Math.min(f.qty, left));
       left -= take;
-      // Nothing for this one — keep the row only if the run explicitly
-      // declared the variant. An unordered, unscoped finish holding zero is
-      // just a blank line on the run, the sheet and the stock dialog.
-      if (take === 0 && !declared.has(f.variantId)) continue;
+      // Only a row with no pieces AND nobody waiting is noise.
+      if (take === 0 && f.qty === 0 && !declared.has(f.variantId)) continue;
       short.push({
         variantId: f.variantId,
         variantTitle: f.variantTitle,

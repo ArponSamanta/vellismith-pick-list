@@ -674,6 +674,12 @@ function scopeLabel(product: BatchProductView): string {
       product.variantIds.length === 1 ? "variant" : "variants"
     } only`;
   }
+  // Never claim a narrower scope than the run actually has. Names are resolved
+  // through the finishes, and a scoped variant without one would silently drop
+  // out — which read as "Thin / Gold Plated only" on a run that had in fact
+  // claimed Pipe / Silver and Pipe / Gold Plated as well.
+  const missing = product.variantIds.length - names.length;
+  if (missing > 0) return `${names.join(", ")} +${missing} more only`;
   return `${names.join(", ")} only`;
 }
 
@@ -1852,9 +1858,12 @@ export default function BatchPage() {
                       <span className="bt-pick-text">
                         <span className="bt-pick-title">{p.productTitle}</span>
                         <span className="bt-pick-sub">
+                          {/* "of N" only when the scope actually narrows the
+                              commitment. Ticking every ordered variant left it
+                              reading "13 on order of 13". */}
                           {p.committed > 0
                             ? `${committedFor(p)} on order` +
-                              (p.scope.size > 0
+                              (committedFor(p) < p.committed
                                 ? ` of ${p.committed}`
                                 : "")
                             : "stock only"}
@@ -3057,36 +3066,34 @@ function ProductRow({
               <div key={finish.id} className="bt-routerow">
                 <span className="bt-route-name">{finish.variantTitle || "—"}</span>
                 <span className="bt-pathchips">
+                  {/* Straight off the variant's route, so EVERY stage is
+                      skippable — a plain band that needs no setting, a
+                      bought-in part that needs no casting.
+
+                      This used to be derived from remainingStages, which only
+                      covers the split stage onward, plus "anything earlier is
+                      on". So a stage before the split always rendered as
+                      included whatever the route actually said: clicking it
+                      did save the skip, the chip sprang back to on, and there
+                      was no way to undo it. */}
                   {STAGES.map((stage) => {
-                    const on = !finish.doneAtSplit
-                      ? finish.remainingStages.includes(stage) ||
-                        (product.splitStage !== null &&
-                          STAGES.indexOf(stage) <
-                            STAGES.indexOf(product.splitStage))
-                      : product.splitStage !== null &&
-                        STAGES.indexOf(stage) <
-                          STAGES.indexOf(product.splitStage);
+                    const on = !finish.skipStages.includes(stage);
+                    const name = finish.variantTitle || "This finish";
                     return (
                       <button
                         key={stage}
                         className={on ? "bt-pathchip on" : "bt-pathchip"}
                         disabled={busy}
+                        aria-pressed={on}
                         title={
                           on
-                            ? `${finish.variantTitle || "This finish"} skips ${STAGE_LABELS[stage]} from now on`
-                            : `Include ${STAGE_LABELS[stage]}`
+                            ? `${name} goes through ${STAGE_LABELS[stage]} — click to skip it from now on`
+                            : `${name} skips ${STAGE_LABELS[stage]} — click to include it again`
                         }
                         onClick={() => {
-                          const skip = STAGES.filter((s) =>
-                            s === stage
-                              ? on
-                              : !(
-                                  finish.remainingStages.includes(s) ||
-                                  (product.splitStage !== null &&
-                                    STAGES.indexOf(s) <
-                                      STAGES.indexOf(product.splitStage))
-                                )
-                          );
+                          const skip = on
+                            ? [...finish.skipStages, stage]
+                            : finish.skipStages.filter((s) => s !== stage);
                           onSubmit({
                             intent: "route",
                             batchId: batch.id,
