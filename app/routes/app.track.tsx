@@ -468,34 +468,19 @@ export default function TrackPage() {
     return full;
   }, [effectiveLines]);
 
-  /** Counts for the selector, so it says what it will do before you press it. */
-  const packCounts = useMemo(() => {
-    let full = 0;
-    let partial = 0;
-    for (const line of effectiveLines) {
-      if (line.column !== "READY_TO_SHIP") continue;
-      if (fullyReadyOrders.has(line.orderId)) full += 1;
-      else partial += 1;
-    }
-    return { full, partial };
-  }, [effectiveLines, fullyReadyOrders]);
-
-  const filtered = useMemo(() => {
+  /**
+   * Everything the search and date range allow, BEFORE the pack filter.
+   *
+   * Split out so the selector's counts can be drawn from it. Counting the
+   * whole board instead made the buttons read "21 / 169" next to a searched
+   * column showing 2 — numbers describing a list nobody could see.
+   */
+  const searchFiltered = useMemo(() => {
     const q = search.trim().toLowerCase();
     const ranged = Boolean(dueFrom || dueTo);
-
-    // Applies to the finished column only: everywhere else the question has no
-    // meaning, and hiding work in progress by it would be a trap.
-    const packOk = (l: TrackedLine) => {
-      if (packFilter === "ALL" || l.column !== "READY_TO_SHIP") return true;
-      const full = fullyReadyOrders.has(l.orderId);
-      return packFilter === "FULL" ? full : !full;
-    };
-
-    if (!q && !ranged && packFilter === "ALL") return effectiveLines;
+    if (!q && !ranged) return effectiveLines;
 
     return effectiveLines.filter((l) => {
-      if (!packOk(l)) return false;
       // A range excludes anything with no promised date — an undated piece
       // isn't "due in this window", it has no due date at all.
       if (ranged && !withinDateRange(l.promisedDate, dueFrom, dueTo)) {
@@ -510,7 +495,35 @@ export default function TrackPage() {
         (l.note ?? "").toLowerCase().includes(q)
       );
     });
-  }, [effectiveLines, search, dueFrom, dueTo, packFilter, fullyReadyOrders]);
+  }, [effectiveLines, search, dueFrom, dueTo]);
+
+  /**
+   * Counts for the selector: what the search has left, split by readiness.
+   *
+   * Deliberately NOT filtered by packFilter itself — picking one would
+   * otherwise zero the other and there would be no way back.
+   */
+  const packCounts = useMemo(() => {
+    let full = 0;
+    let partial = 0;
+    for (const line of searchFiltered) {
+      if (line.column !== "READY_TO_SHIP") continue;
+      if (fullyReadyOrders.has(line.orderId)) full += 1;
+      else partial += 1;
+    }
+    return { full, partial };
+  }, [searchFiltered, fullyReadyOrders]);
+
+  const filtered = useMemo(() => {
+    if (packFilter === "ALL") return searchFiltered;
+    // Applies to the finished column only: everywhere else the question has no
+    // meaning, and hiding work in progress by it would be a trap.
+    return searchFiltered.filter((l) => {
+      if (l.column !== "READY_TO_SHIP") return true;
+      const full = fullyReadyOrders.has(l.orderId);
+      return packFilter === "FULL" ? full : !full;
+    });
+  }, [searchFiltered, packFilter, fullyReadyOrders]);
 
   const byColumn = useMemo(() => {
     const map = new Map<BoardColumn, TrackedLine[]>();
@@ -742,9 +755,10 @@ export default function TrackPage() {
               <button
                 className={packFilter === "ALL" ? "tk-pack-btn on" : "tk-pack-btn"}
                 aria-pressed={packFilter === "ALL"}
+                title="Every ready-to-ship piece, whatever state its order is in"
                 onClick={() => setPackFilter("ALL")}
               >
-                All ready
+                All ({packCounts.full + packCounts.partial})
               </button>
               <button
                 className={
@@ -754,6 +768,7 @@ export default function TrackPage() {
                 title="Every outstanding line of the order is ready — it can be packed"
                 onClick={() => setPackFilter("FULL")}
               >
+                <span className="tk-pack-dot" />
                 Fully ready ({packCounts.full})
               </button>
               <button
@@ -766,6 +781,7 @@ export default function TrackPage() {
                 title="The order still has lines that are not ready — it cannot go out yet"
                 onClick={() => setPackFilter("PARTIAL")}
               >
+                <span className="tk-pack-dot" />
                 Partially packed ({packCounts.partial})
               </button>
             </div>
@@ -1339,28 +1355,62 @@ const TRACK_CSS = `
 .tk-card:hover { box-shadow: 0 3px 10px color-mix(in srgb, #2d2b2b 16%, transparent); }
 
 /* Whether the whole ORDER can be packed, not whether this piece is done —
-   every card in this column is done. A thick left edge rather than a tint, so
-   it survives both themes and reads down the column at a glance.
+   every card in this column is done.
 
-   Literal colours: this is a traffic light and must mean the same thing in
-   light and dark. They match the green already used for ready-to-ship counts
-   and the amber/red used for shortfalls elsewhere. */
-.tk-card[data-packed="full"] { border-left: 4px solid #1c6b3a; }
-.tk-card[data-packed="partial"] { border-left: 4px solid #b3261e; }
+   An INSET shadow, not a wider border. A 4px left border on top of the card's
+   1px made coloured cards 3px wider than plain ones, so their contents sat
+   three pixels right of everything else in the column. This paints inside the
+   existing box, so nothing moves.
 
-/* Ready-to-ship view selector. */
-.tk-pack { display: flex; gap: 0; flex: none; }
+   A whisper of tint carries the signal across the whole card, which is what
+   makes the column scannable; the bar alone was a stripe you had to look for.
+
+   Literal colours: a traffic light has to mean the same thing in both themes.
+   They match the green already used for ready-to-ship counts and the red used
+   for shortfalls.
+
+   No backticks anywhere in this block: it lives inside a template literal, and
+   one would end the string and swallow the rest of the file. */
+.tk-card[data-packed] { box-shadow: inset 3px 0 0 var(--pack-edge); }
+.tk-card[data-packed]:hover {
+  box-shadow: inset 3px 0 0 var(--pack-edge),
+    0 3px 10px color-mix(in srgb, #2d2b2b 16%, transparent);
+}
+.tk-card[data-packed="full"] {
+  --pack-edge: #1c6b3a;
+  background: color-mix(in srgb, #1c6b3a 5%, var(--color-bg));
+  border-color: color-mix(in srgb, #1c6b3a 30%, var(--color-divider));
+}
+.tk-card[data-packed="partial"] {
+  --pack-edge: #b3261e;
+  background: color-mix(in srgb, #b3261e 4%, var(--color-bg));
+  border-color: color-mix(in srgb, #b3261e 26%, var(--color-divider));
+}
+
+/* Ready-to-ship view selector. Sits at the end of the toolbar and keeps its
+   own width — it must not squeeze the search box, which is used far more. */
+.tk-pack { display: flex; gap: 0; flex: none; margin-left: auto; }
 .tk-pack-btn {
   font-family: var(--font-heading); font-weight: 800; font-size: 11px;
-  padding: 8px 10px; border: 1px solid var(--color-divider);
+  padding: 9px 11px; border: 1px solid var(--color-divider);
   background: transparent; color: var(--color-neutral-600); cursor: pointer;
-  white-space: nowrap;
+  white-space: nowrap; display: inline-flex; align-items: center; gap: 6px;
 }
 .tk-pack-btn + .tk-pack-btn { border-left: none; }
+.tk-pack-btn:hover { color: var(--color-text); }
+/* The dot carries the colour when the button is off, so the legend for the
+   cards is readable without having to select anything. */
+.tk-pack-dot {
+  width: 7px; height: 7px; border-radius: 50%; flex: none;
+  background: var(--pack-edge, var(--color-neutral-600));
+}
+.tk-pack-btn.full { --pack-edge: #1c6b3a; }
+.tk-pack-btn.partial { --pack-edge: #b3261e; }
 .tk-pack-btn.on {
   background: var(--color-text); border-color: var(--color-text);
   color: var(--color-bg);
 }
+.tk-pack-btn.on .tk-pack-dot { background: var(--color-bg); }
 .tk-pack-btn.full.on { background: #1c6b3a; border-color: #1c6b3a; }
 .tk-pack-btn.partial.on { background: #b3261e; border-color: #b3261e; }
 .tk-card-top { display: flex; gap: 9px; align-items: flex-start; }
