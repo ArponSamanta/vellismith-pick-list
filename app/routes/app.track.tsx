@@ -1287,7 +1287,10 @@ const TRACK_CSS = `
 .tk-due-filter .input { width: auto; min-width: 150px; }
 .tk-clear-due {
   font-family: var(--font-heading); font-weight: 800; font-size: 12px;
-  padding: 9px 12px; border: 1px solid var(--color-divider);
+  /* Levelled with the date fields for the same reason as the pack buttons. */
+  min-height: 40px; padding: 0 12px;
+  display: inline-flex; align-items: center;
+  border: 1px solid var(--color-divider);
   background: transparent; color: var(--color-accent); cursor: pointer;
 }
 .tk-app .input {
@@ -1392,7 +1395,12 @@ const TRACK_CSS = `
 .tk-pack { display: flex; gap: 0; flex: none; margin-left: auto; }
 .tk-pack-btn {
   font-family: var(--font-heading); font-weight: 800; font-size: 11px;
-  padding: 9px 11px; border: 1px solid var(--color-divider);
+  /* Same min-height as .tk-app .input, so this sits level with the promised
+     date fields it shares a row with. Vertical padding is zero and the flex
+     centring does the work — padding that happened to add up to 40px would
+     drift the moment the font size changed. */
+  min-height: 40px; padding: 0 12px;
+  border: 1px solid var(--color-divider);
   background: transparent; color: var(--color-neutral-600); cursor: pointer;
   white-space: nowrap; display: inline-flex; align-items: center; gap: 6px;
 }
