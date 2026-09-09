@@ -323,6 +323,15 @@ export default function TrackPage() {
   const [dueFrom, setDueFrom] = useState("");
   const [dueTo, setDueTo] = useState("");
   const [mobileColumn, setMobileColumn] = useState<BoardColumn | "ALL">("ALL");
+  /**
+   * Narrows the Ready-to-ship column by whether the whole ORDER is packable.
+   *
+   * "Fully ready" is the pick-and-pack queue; "partially packed" is the pile
+   * that cannot go out yet however finished these particular pieces look.
+   */
+  const [packFilter, setPackFilter] = useState<"ALL" | "FULL" | "PARTIAL">(
+    "ALL"
+  );
   const [editing, setEditing] = useState<TrackedLine | null>(null);
 
   /**
@@ -432,12 +441,61 @@ export default function TrackPage() {
     return () => document.removeEventListener("keydown", onKey);
   }, [editing]);
 
+  /**
+   * Orders whose every outstanding line is ready to ship.
+   *
+   * Computed from the WHOLE board, never from the filtered view. An order is
+   * packable or it isn't, and deriving this from a search result would call an
+   * order ready because a filter happened to hide its unfinished lines — the
+   * one mistake that would send a half-order to the packing bench.
+   *
+   * Only lines still on the board count. Anything already fulfilled has left
+   * it, so an order part-shipped earlier is judged on what remains.
+   */
+  const fullyReadyOrders = useMemo(() => {
+    const outstanding = new Map<string, number>();
+    const ready = new Map<string, number>();
+    for (const line of effectiveLines) {
+      outstanding.set(line.orderId, (outstanding.get(line.orderId) ?? 0) + 1);
+      if (line.column === "READY_TO_SHIP") {
+        ready.set(line.orderId, (ready.get(line.orderId) ?? 0) + 1);
+      }
+    }
+    const full = new Set<string>();
+    for (const [orderId, total] of outstanding) {
+      if ((ready.get(orderId) ?? 0) === total) full.add(orderId);
+    }
+    return full;
+  }, [effectiveLines]);
+
+  /** Counts for the selector, so it says what it will do before you press it. */
+  const packCounts = useMemo(() => {
+    let full = 0;
+    let partial = 0;
+    for (const line of effectiveLines) {
+      if (line.column !== "READY_TO_SHIP") continue;
+      if (fullyReadyOrders.has(line.orderId)) full += 1;
+      else partial += 1;
+    }
+    return { full, partial };
+  }, [effectiveLines, fullyReadyOrders]);
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     const ranged = Boolean(dueFrom || dueTo);
-    if (!q && !ranged) return effectiveLines;
+
+    // Applies to the finished column only: everywhere else the question has no
+    // meaning, and hiding work in progress by it would be a trap.
+    const packOk = (l: TrackedLine) => {
+      if (packFilter === "ALL" || l.column !== "READY_TO_SHIP") return true;
+      const full = fullyReadyOrders.has(l.orderId);
+      return packFilter === "FULL" ? full : !full;
+    };
+
+    if (!q && !ranged && packFilter === "ALL") return effectiveLines;
 
     return effectiveLines.filter((l) => {
+      if (!packOk(l)) return false;
       // A range excludes anything with no promised date — an undated piece
       // isn't "due in this window", it has no due date at all.
       if (ranged && !withinDateRange(l.promisedDate, dueFrom, dueTo)) {
@@ -452,7 +510,7 @@ export default function TrackPage() {
         (l.note ?? "").toLowerCase().includes(q)
       );
     });
-  }, [effectiveLines, search, dueFrom, dueTo]);
+  }, [effectiveLines, search, dueFrom, dueTo, packFilter, fullyReadyOrders]);
 
   const byColumn = useMemo(() => {
     const map = new Map<BoardColumn, TrackedLine[]>();
@@ -676,6 +734,41 @@ export default function TrackPage() {
                 </button>
               )}
             </div>
+
+            {/* Ready-to-ship, split by whether the whole order can go out.
+                Counts are on the buttons so the choice is informed before the
+                click rather than after it. */}
+            <div className="tk-pack" role="group" aria-label="Ready to ship view">
+              <button
+                className={packFilter === "ALL" ? "tk-pack-btn on" : "tk-pack-btn"}
+                aria-pressed={packFilter === "ALL"}
+                onClick={() => setPackFilter("ALL")}
+              >
+                All ready
+              </button>
+              <button
+                className={
+                  packFilter === "FULL" ? "tk-pack-btn on full" : "tk-pack-btn full"
+                }
+                aria-pressed={packFilter === "FULL"}
+                title="Every outstanding line of the order is ready — it can be packed"
+                onClick={() => setPackFilter("FULL")}
+              >
+                Fully ready ({packCounts.full})
+              </button>
+              <button
+                className={
+                  packFilter === "PARTIAL"
+                    ? "tk-pack-btn on partial"
+                    : "tk-pack-btn partial"
+                }
+                aria-pressed={packFilter === "PARTIAL"}
+                title="The order still has lines that are not ready — it cannot go out yet"
+                onClick={() => setPackFilter("PARTIAL")}
+              >
+                Partially packed ({packCounts.partial})
+              </button>
+            </div>
           </div>
 
           {/* An active range hides undated work entirely, which would
@@ -771,6 +864,24 @@ export default function TrackPage() {
                           <div
                             key={line.lineItemId}
                             className="tk-card"
+                            /* Only meaningful in the finished column: a piece
+                               being ready says nothing about whether its ORDER
+                               can be packed. Elsewhere the attribute is absent
+                               so no colour is painted. */
+                            data-packed={
+                              line.column === "READY_TO_SHIP"
+                                ? fullyReadyOrders.has(line.orderId)
+                                  ? "full"
+                                  : "partial"
+                                : undefined
+                            }
+                            title={
+                              line.column === "READY_TO_SHIP"
+                                ? fullyReadyOrders.has(line.orderId)
+                                  ? `Every line of ${line.orderName} is ready — it can be packed`
+                                  : `${line.orderName} still has lines that are not ready`
+                                : undefined
+                            }
                             onClick={() => setEditing(line)}
                             role="button"
                             tabIndex={0}
@@ -1226,6 +1337,32 @@ const TRACK_CSS = `
   padding: 10px; cursor: pointer; transition: box-shadow 160ms ease;
 }
 .tk-card:hover { box-shadow: 0 3px 10px color-mix(in srgb, #2d2b2b 16%, transparent); }
+
+/* Whether the whole ORDER can be packed, not whether this piece is done —
+   every card in this column is done. A thick left edge rather than a tint, so
+   it survives both themes and reads down the column at a glance.
+
+   Literal colours: this is a traffic light and must mean the same thing in
+   light and dark. They match the green already used for ready-to-ship counts
+   and the amber/red used for shortfalls elsewhere. */
+.tk-card[data-packed="full"] { border-left: 4px solid #1c6b3a; }
+.tk-card[data-packed="partial"] { border-left: 4px solid #b3261e; }
+
+/* Ready-to-ship view selector. */
+.tk-pack { display: flex; gap: 0; flex: none; }
+.tk-pack-btn {
+  font-family: var(--font-heading); font-weight: 800; font-size: 11px;
+  padding: 8px 10px; border: 1px solid var(--color-divider);
+  background: transparent; color: var(--color-neutral-600); cursor: pointer;
+  white-space: nowrap;
+}
+.tk-pack-btn + .tk-pack-btn { border-left: none; }
+.tk-pack-btn.on {
+  background: var(--color-text); border-color: var(--color-text);
+  color: var(--color-bg);
+}
+.tk-pack-btn.full.on { background: #1c6b3a; border-color: #1c6b3a; }
+.tk-pack-btn.partial.on { background: #b3261e; border-color: #b3261e; }
 .tk-card-top { display: flex; gap: 9px; align-items: flex-start; }
 .tk-card img, .tk-noimg {
   width: 40px; height: 40px; object-fit: cover; flex: none;

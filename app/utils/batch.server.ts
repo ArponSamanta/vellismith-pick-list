@@ -793,15 +793,26 @@ function toBatchView(
     const closed = lines.filter((l) => l.liveQuantity === null).length;
     closedLines += closed;
 
-    // New orders this run could still take on: unclaimed, for this product,
-    // and within whatever variant scope the run was narrowed to.
-    const unclaimedInScope = (
-      candidates.get(product.productId)?.lines ?? []
-    ).filter((l) => inScope(product.variantIds, l.variantId));
-
     const scrapped = product.scraps.reduce((sum, s) => sum + s.quantity, 0);
     const made = madeQuantity(product.plannedQuantity, scrapped);
     const committed = lines.reduce((sum, l) => sum + (l.liveQuantity ?? 0), 0);
+
+    // New orders this run could still take on: unclaimed, for this product,
+    // within its variant scope, AND affordable out of the spare pieces.
+    //
+    // The affordability pass mirrors addUnclaimedLines exactly, greedy and
+    // whole-line, because that is the function the button calls. Counting
+    // scope alone offered "1 more piece ordered" on a run with nothing going
+    // spare, and the button then refused with "this run has no spare pieces"
+    // — the banner promising work it could not do.
+    let affordableSpare = Math.max(0, made - committed);
+    const unclaimedInScope = (candidates.get(product.productId)?.lines ?? [])
+      .filter((l) => inScope(product.variantIds, l.variantId))
+      .filter((l) => {
+        if (l.quantity > affordableSpare) return false;
+        affordableSpare -= l.quantity;
+        return true;
+      });
 
     // Live demand per finish — the floor the split handler must respect.
     const demand = new Map<string, number>();
