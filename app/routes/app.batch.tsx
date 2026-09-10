@@ -1330,8 +1330,19 @@ export default function BatchPage() {
    *
    * The run's existing finishes come from what was ordered — but the whole
    * point of the plating handler is deciding to plate pieces nobody ordered
-   * yet, so the product's other variants have to be offered too. They arrive
-   * from the catalogue lookup fired when the dialog opens.
+   * yet, so other variants have to be offered too. They arrive from the
+   * catalogue lookup fired when the dialog opens.
+   *
+   * Narrowed to the run's SCOPE when it has one. This used to offer the whole
+   * catalogue on the reasoning that scope limits commitments, not capability —
+   * a raw piece can become anything. That is true of raw metal and false by
+   * the time this dialog opens: the split is at Plating, and a piece already
+   * carrying a screw post cannot be plated into a clip-on. Offering every
+   * fitting the product sells made the list long and most of it impossible.
+   *
+   * A run with no scope has told us nothing, so it still sees everything.
+   * Existing finishes are always included, so narrowing can never make a row
+   * that already holds pieces disappear.
    */
   const splitOptions = useMemo(() => {
     if (!splitting) return [];
@@ -1358,6 +1369,12 @@ export default function BatchPage() {
 
     for (const v of products.data?.variants ?? []) {
       if (v.productId !== product.productId || seen.has(v.variantId)) continue;
+      if (
+        product.variantIds.length > 0 &&
+        !product.variantIds.includes(v.variantId)
+      ) {
+        continue;
+      }
       // A variant with no run history yet: assume it takes every stage from
       // the split onward. Its route is corrected once, then remembered.
       const remaining = product.splitStage
