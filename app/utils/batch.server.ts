@@ -584,6 +584,14 @@ export async function autoAllocate(params: {
       skipDuplicates: true,
     });
 
+    // The same covering re-seed the manual add does. Claiming an order here
+    // and leaving the allocation untouched is what put a run's five pieces on
+    // one finish while its only order waited on another.
+    await recoverAllocation({
+      batchProductId: suggestion.batchProductId,
+      board,
+    });
+
     // The piece filling this order is already at the run's stage, so the
     // order line belongs there too.
     await moveLine({
@@ -1371,6 +1379,78 @@ function seedFinishes(
   }));
 }
 
+/**
+ * Re-seed a product's covering allocation from the orders it now holds.
+ *
+ * Called by EVERY path that claims an order line. Without it, absorbing a
+ * silver order into an all-gold run created the order line and nothing else:
+ * the finishes still read 100% gold, allocated still equalled made so the
+ * product looked reconciled, and the run could pass Plating and write every
+ * piece to stock as gold with a silver order sitting unfilled.
+ *
+ * It lived inline in addUnclaimedLines, so the auto-allocate banner — which
+ * claims lines by a different route — skipped it entirely. That is how a live
+ * run ended up holding five pieces on Silver / Screw with its one real order
+ * owed on Gold-Plated / Screw. Shared here so the two paths cannot drift
+ * again.
+ *
+ * Only while the split is undecided. After it the quantities are a decision
+ * somebody made, and silently rewriting them would erase it; splitDue flags
+ * the mismatch instead so they can redo it deliberately.
+ */
+async function recoverAllocation(params: {
+  batchProductId: string;
+  board: { lines: TrackedLine[] };
+}): Promise<void> {
+  const product = await db.batchProduct.findUnique({
+    where: { id: params.batchProductId },
+    include: { finishes: true, items: true, scraps: true },
+  });
+  if (!product || product.splitDecidedAt) return;
+
+  const scrapped = product.scraps.reduce((sum, s) => sum + s.quantity, 0);
+  const made = madeQuantity(product.plannedQuantity, scrapped);
+
+  // Read back from the database rather than taking the caller's list: by the
+  // time this runs the new items are written, so this is the whole truth
+  // without the caller having to hand it over correctly.
+  const liveLines = product.items
+    .map((i) => params.board.lines.find((l) => l.lineItemId === i.lineItemId))
+    .filter((l): l is TrackedLine => Boolean(l));
+
+  // Scoped variants keep their row through the re-seed. Their identity is
+  // already stored on the existing finishes, so this costs no lookup.
+  const declared = product.finishes.filter((f) =>
+    product.variantIds.includes(f.variantId)
+  );
+  const wanted = seedFinishes(liveLines, made, declared);
+  const byVariant = new Map(product.finishes.map((f) => [f.variantId, f]));
+
+  await db.$transaction(async (tx) => {
+    for (const finish of wanted) {
+      const existing = byVariant.get(finish.variantId);
+      if (!existing) {
+        await tx.batchFinish.create({
+          data: { batchProductId: product.id, ...finish },
+        });
+      } else if (existing.quantity !== finish.quantity) {
+        await tx.batchFinish.update({
+          where: { id: existing.id },
+          data: { quantity: finish.quantity },
+        });
+      }
+    }
+    // A finish the covering default no longer includes. Safe to drop: no
+    // split has been made, so nothing here was chosen by hand.
+    const keep = new Set(wanted.map((f) => f.variantId));
+    for (const finish of product.finishes) {
+      if (!keep.has(finish.variantId)) {
+        await tx.batchFinish.delete({ where: { id: finish.id } });
+      }
+    }
+  });
+}
+
 async function claimedLineIds(shop: string): Promise<Set<string>> {
   const rows = await db.batchItem.findMany({
     where: { batchProduct: { batch: { shop, status: { in: CLAIMING_STATUSES } } } },
@@ -1823,57 +1903,7 @@ export async function addUnclaimedLines(params: {
     skipDuplicates: true,
   });
 
-  // Keep the allocation covering the demand it now holds.
-  //
-  // Without this, absorbing a silver order into a gold run created the order
-  // line and nothing else: the finishes still read 100% gold, allocated still
-  // equalled made so the product looked reconciled, and splitDue needs more
-  // than one finish — so the run could pass Plating, be marked Made, and write
-  // every piece to stock as gold with a silver order sitting unfilled.
-  //
-  // Only while the split is undecided. After it the quantities are a decision
-  // somebody made, and silently rewriting them would erase it; splitDue flags
-  // the shortfall instead so they can redo it deliberately.
-  if (!product.splitDecidedAt) {
-    const liveLines: TrackedLine[] = [
-      ...product.items
-        .map((i) => board.lines.find((l) => l.lineItemId === i.lineItemId))
-        .filter((l): l is TrackedLine => Boolean(l)),
-      ...affordable,
-    ];
-
-    // Scoped variants keep their row through the re-seed. Their identity is
-    // already stored on the existing finishes, so this costs no lookup.
-    const declared = product.finishes.filter((f) =>
-      product.variantIds.includes(f.variantId)
-    );
-    const wanted = seedFinishes(liveLines, made, declared);
-    const byVariant = new Map(product.finishes.map((f) => [f.variantId, f]));
-
-    await db.$transaction(async (tx) => {
-      for (const finish of wanted) {
-        const existing = byVariant.get(finish.variantId);
-        if (!existing) {
-          await tx.batchFinish.create({
-            data: { batchProductId: product.id, ...finish },
-          });
-        } else if (existing.quantity !== finish.quantity) {
-          await tx.batchFinish.update({
-            where: { id: existing.id },
-            data: { quantity: finish.quantity },
-          });
-        }
-      }
-      // A finish the covering default no longer includes. Safe to drop: no
-      // split has been made, so nothing here was chosen by hand.
-      const keep = new Set(wanted.map((f) => f.variantId));
-      for (const finish of product.finishes) {
-        if (!keep.has(finish.variantId)) {
-          await tx.batchFinish.delete({ where: { id: finish.id } });
-        }
-      }
-    });
-  }
+  await recoverAllocation({ batchProductId: product.id, board });
 
   const status = isBatchStatus(batch.status) ? batch.status : "OPEN";
   const stage = (batch.stage as TrackStage | null) ?? null;
