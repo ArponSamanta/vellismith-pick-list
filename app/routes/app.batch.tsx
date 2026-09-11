@@ -472,6 +472,28 @@ function positionLabel(batch: BatchView): string {
   return batch.stage ? STAGE_LABELS[batch.stage] : "Not started";
 }
 
+/**
+ * Where a run sits, as a filterable key.
+ *
+ * Deliberately not just `batch.stage`: a run with no stage is either waiting to
+ * start or already finished, and those are the two things somebody scanning the
+ * page most often wants to separate. So the key spans the whole life of a run —
+ * not started, each stage, made — which is exactly what positionLabel prints.
+ */
+const RUN_POSITIONS = ["NOT_STARTED", ...STAGES, "MADE"] as const;
+type RunPosition = (typeof RUN_POSITIONS)[number];
+
+function runPosition(batch: BatchView): RunPosition {
+  if (batch.status === "MADE") return "MADE";
+  return batch.stage ?? "NOT_STARTED";
+}
+
+const RUN_POSITION_LABELS: Record<RunPosition, string> = {
+  NOT_STARTED: "Not started",
+  ...STAGE_LABELS,
+  MADE: "Made",
+};
+
 // ─── Printable run sheet ──────────────────────────────────────────────────
 
 /**
@@ -816,6 +838,11 @@ export default function BatchPage() {
   const loading = data.state === "loading" || data.data === undefined;
 
   const [search, setSearch] = useState("");
+  /**
+   * Which positions to show. Empty means all of them — the state nobody has to
+   * think about, and the same convention the pick list's stage filter uses.
+   */
+  const [stageFilter, setStageFilter] = useState<Set<RunPosition>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [showArchived, setShowArchived] = useState(false);
   const [showSuggestions, setShowSuggestions] = useState(false);
@@ -1234,18 +1261,34 @@ export default function BatchPage() {
   const liveBatches = batches.filter((b) => b.status !== "CLOSED");
   const archived = batches.filter((b) => b.status === "CLOSED");
 
-  const visibleBatches = liveBatches.filter((b) =>
+  // Search first, stage second. Splitting them lets the stage chips carry
+  // counts of what the SEARCH has left — and not have those counts collapse to
+  // zero the moment a stage is picked, which would leave no way back.
+  const searchedBatches = liveBatches.filter((b) =>
     matches(
       [
         b.name,
         ...b.products.flatMap((p) => [
           p.productTitle,
-          ...p.finishes.map((f) => f.variantTitle),
+          // SKUs are in the placeholder's promise, so they had better be in
+          // the haystack. Runs were matching on titles only.
+          ...p.finishes.flatMap((f) => [f.variantTitle, f.sku ?? ""]),
         ]),
       ],
       q
     )
   );
+
+  const positionCounts = new Map<RunPosition, number>();
+  for (const b of searchedBatches) {
+    const at = runPosition(b);
+    positionCounts.set(at, (positionCounts.get(at) ?? 0) + 1);
+  }
+
+  const visibleBatches =
+    stageFilter.size === 0
+      ? searchedBatches
+      : searchedBatches.filter((b) => stageFilter.has(runPosition(b)));
   const visibleCandidates = candidates.filter((c) =>
     matches(
       [c.productTitle, ...c.variants.flatMap((v) => [v.variantTitle, v.sku ?? ""])],
@@ -1530,6 +1573,50 @@ export default function BatchPage() {
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
+
+            {/* Where each run has got to. Multi-select, because "what is at
+                Polishing or Plating" is one question, and forcing it to be
+                asked twice would mean reading the page twice.
+
+                A position with nothing in it is still shown, greyed and
+                unclickable: its absence is information — "nothing is at
+                Setting" — and a list that reshuffles as runs advance would be
+                harder to aim at than one that holds still. */}
+            <div className="bt-stagebar" role="group" aria-label="Filter by stage">
+              {RUN_POSITIONS.map((pos) => {
+                const n = positionCounts.get(pos) ?? 0;
+                const on = stageFilter.has(pos);
+                return (
+                  <button
+                    key={pos}
+                    type="button"
+                    className={on ? "bt-stagechip on" : "bt-stagechip"}
+                    aria-pressed={on}
+                    disabled={n === 0 && !on}
+                    onClick={() =>
+                      setStageFilter((current) => {
+                        const next = new Set(current);
+                        if (next.has(pos)) next.delete(pos);
+                        else next.add(pos);
+                        return next;
+                      })
+                    }
+                  >
+                    {RUN_POSITION_LABELS[pos]}
+                    <span className="bt-stagechip-n">{n}</span>
+                  </button>
+                );
+              })}
+              {stageFilter.size > 0 && (
+                <button
+                  type="button"
+                  className="bt-stagechip bt-stagechip-clear"
+                  onClick={() => setStageFilter(new Set())}
+                >
+                  Clear
+                </button>
+              )}
+            </div>
           </div>
 
           {(loadError || actionError) && (
@@ -1641,9 +1728,13 @@ export default function BatchPage() {
               <div className="bt-empty">
                 <IconEmpty />
                 <p>
+                  {/* Name the filter that emptied the list, so an active
+                      stage chip can't be mistaken for "there are no runs". */}
                   {liveBatches.length === 0
                     ? "No runs yet. Start one from the outstanding work below."
-                    : "No runs match that search."}
+                    : stageFilter.size > 0 && searchedBatches.length > 0
+                      ? "No runs at that stage."
+                      : "No runs match that search."}
                 </p>
               </div>
             ) : (
@@ -3438,7 +3529,31 @@ const BATCH_CSS = `
 .bt-legend { font-size: 11px; color: var(--color-neutral-600); padding: 10px 0 0; margin: 0; }
 .bt-legend b { font-family: var(--font-heading); color: var(--color-text); }
 
-.bt-toolbar { padding: 18px 0; }
+.bt-toolbar { padding: 18px 0; display: flex; flex-direction: column; gap: 10px; }
+
+/* Stage filter. Wraps rather than scrolls: eight positions on a narrow screen
+   should stack, not hide behind a swipe nobody knows is there. */
+.bt-stagebar { display: flex; flex-wrap: wrap; gap: 4px; }
+.bt-stagechip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--font-heading); font-weight: 800; font-size: 10px;
+  letter-spacing: .06em; text-transform: uppercase;
+  padding: 6px 9px; cursor: pointer;
+  border: 1px solid var(--color-divider);
+  background: transparent; color: var(--color-neutral-600);
+}
+.bt-stagechip:hover:not(:disabled) { border-color: var(--color-text); color: var(--color-text); }
+.bt-stagechip.on {
+  background: var(--color-text); border-color: var(--color-text);
+  color: var(--color-bg);
+}
+/* An empty position stays listed — "nothing is at Setting" is worth knowing —
+   but cannot be selected into an empty screen. */
+.bt-stagechip:disabled { opacity: .4; cursor: default; }
+.bt-stagechip-n {
+  font-size: 10px; opacity: .75; font-variant-numeric: tabular-nums;
+}
+.bt-stagechip-clear { color: var(--color-accent); }
 
 .bt-error {
   border: 1px solid var(--color-accent); background: #fff2ef;
