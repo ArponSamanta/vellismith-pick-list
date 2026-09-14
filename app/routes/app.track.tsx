@@ -332,6 +332,19 @@ export default function TrackPage() {
   const [packFilter, setPackFilter] = useState<"ALL" | "FULL" | "PARTIAL">(
     "ALL"
   );
+  /**
+   * The one card whose move is armed and waiting for a second tap.
+   *
+   * Exactly one at a time: arming a different card disarms this one, so a
+   * forgotten confirm can never be sitting somewhere off-screen waiting for a
+   * stray thumb. That property is most of the safety — more than any timeout,
+   * which would only replace "I tapped it by accident" with "I tapped confirm
+   * and nothing happened".
+   */
+  const [armed, setArmed] = useState<{
+    lineItemId: string;
+    dir: "next" | "back";
+  } | null>(null);
   const [editing, setEditing] = useState<TrackedLine | null>(null);
 
   /**
@@ -431,15 +444,18 @@ export default function TrackPage() {
     );
   }, [effectiveLines]);
 
-  // Escape closes the editor, as any dialog should.
+  // Escape closes the editor, as any dialog should — and disarms a pending
+  // move, which is the same instinct reaching for the same key.
   useEffect(() => {
-    if (!editing) return;
+    if (!editing && !armed) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setEditing(null);
+      if (e.key !== "Escape") return;
+      setEditing(null);
+      setArmed(null);
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [editing]);
+  }, [editing, armed]);
 
   /**
    * Orders whose every outstanding line is ready to ship.
@@ -592,6 +608,27 @@ export default function TrackPage() {
   const revert = (line: TrackedLine) => {
     const back = prevStep(line.column);
     if (back) move(line, back.status, back.stage);
+  };
+
+  /**
+   * Where an arrow would send this line — the whole point of the confirm.
+   *
+   * Naming the destination is what makes the second tap worth asking for. "Are
+   * you sure?" only slows you down; "→ Polishing?" is a thing you can actually
+   * check before agreeing to it.
+   */
+  const moveTarget = (
+    line: TrackedLine,
+    dir: "next" | "back"
+  ): BoardColumn | null => {
+    if (dir === "next") {
+      if (line.column === UNTRIAGED) return STAGES[0];
+      if (!line.stage) return null;
+      const { status, stage } = nextStep(line.stage);
+      return columnFor(status, stage);
+    }
+    const back = prevStep(line.column);
+    return back ? columnFor(back.status, back.stage) : null;
   };
 
   /** Save the promised date, the note, or both. Omitted fields are untouched. */
@@ -1034,14 +1071,55 @@ export default function TrackPage() {
                                     Make
                                   </button>
                                 </span>
+                              ) : armed?.lineItemId === line.lineItemId ? (
+                                /* Armed. The destination is spelled out, so
+                                   the second tap is a decision rather than a
+                                   reflex — and a wrong first tap costs one
+                                   glance, not an undo. */
+                                <span className="tk-confirm">
+                                  <span className="tk-confirm-to">
+                                    {(() => {
+                                      const to = moveTarget(line, armed.dir);
+                                      return to ? COLUMN_LABELS[to] : "—";
+                                    })()}
+                                    ?
+                                  </span>
+                                  <button
+                                    className="tk-confirm-yes"
+                                    title="Confirm the move"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      const dir = armed.dir;
+                                      setArmed(null);
+                                      if (dir === "next") advance(line);
+                                      else revert(line);
+                                    }}
+                                  >
+                                    Move
+                                  </button>
+                                  <button
+                                    className="tk-confirm-no"
+                                    title="Leave it where it is"
+                                    aria-label="Cancel the move"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setArmed(null);
+                                    }}
+                                  >
+                                    ×
+                                  </button>
+                                </span>
                               ) : (
                                 <span className="tk-flags">
                                   <button
                                     className="tk-next"
-                                                                        title="Move back a step"
+                                    title="Move back a step"
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      revert(line);
+                                      setArmed({
+                                        lineItemId: line.lineItemId,
+                                        dir: "back",
+                                      });
                                     }}
                                   >
                                     <IconArrow back />
@@ -1049,10 +1127,13 @@ export default function TrackPage() {
                                   {col !== "READY_TO_SHIP" && (
                                     <button
                                       className="tk-next"
-                                                                            title="Advance to next stage"
+                                      title="Advance to next stage"
                                       onClick={(e) => {
                                         e.stopPropagation();
-                                        advance(line);
+                                        setArmed({
+                                          lineItemId: line.lineItemId,
+                                          dir: "next",
+                                        });
                                       }}
                                     >
                                       <IconArrow />
@@ -1512,6 +1593,34 @@ const TRACK_CSS = `
 .tk-next:hover:not(:disabled) {
   background: var(--color-accent); border-color: var(--color-accent); color: #fff;
 }
+
+/* A move waiting on its second tap. Occupies the same corner as the arrows it
+   replaces and is sized to match them, so arming a card doesn't reflow the
+   column under the thumb that is about to confirm. */
+.tk-confirm {
+  display: inline-flex; align-items: center; gap: 4px; flex: none;
+  min-height: 28px;
+}
+.tk-confirm-to {
+  font-family: var(--font-heading); font-weight: 800; font-size: 10px;
+  letter-spacing: .05em; text-transform: uppercase;
+  color: var(--color-accent); white-space: nowrap;
+}
+.tk-confirm-yes, .tk-confirm-no {
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 28px; flex: none; cursor: pointer;
+  font-family: var(--font-heading); font-weight: 800; font-size: 11px;
+  border: 1px solid var(--color-accent);
+}
+.tk-confirm-yes {
+  padding: 0 9px;
+  background: var(--color-accent); color: #fff;
+}
+.tk-confirm-no {
+  width: 28px; font-size: 15px; line-height: 1;
+  background: transparent; color: var(--color-accent);
+}
+.tk-confirm-no:hover { background: var(--color-accent); color: #fff; }
 .tk-next:disabled { opacity: .4; cursor: default; }
 
 /* Editor sheet — centred dialog on desktop, bottom sheet on phones. */

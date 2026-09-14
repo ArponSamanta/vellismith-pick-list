@@ -2989,6 +2989,27 @@ function ProductRow({
   onSubmit: (fields: Record<string, string | string[]>) => void;
   onSplit: () => void;
 }) {
+  /**
+   * The one removal in this row waiting for a second tap.
+   *
+   * Both removals send work back to Untriaged, and neither is undoable from
+   * the page — the run forgets the line, and re-adding it means finding it in
+   * the candidate list again. Worth a deliberate second press.
+   *
+   * Scoped to the row rather than the page: unlike the tracker's board there
+   * are only ever a handful of these on screen, each sitting next to the thing
+   * it removes, so a forgotten confirm cannot hide somewhere off-screen.
+   */
+  const [armedRemove, setArmedRemove] = useState<
+    { kind: "product" } | { kind: "line"; lineItemId: string } | null
+  >(null);
+
+  // Collapsing the row hides the order lines; an armed line-removal must not
+  // survive out of sight.
+  useEffect(() => {
+    if (!expanded) setArmedRemove((a) => (a?.kind === "line" ? null : a));
+  }, [expanded]);
+
   const [editingQty, setEditingQty] = useState(false);
   const [qty, setQty] = useState(String(product.plannedQuantity));
   const [scrapQty, setScrapQty] = useState("");
@@ -3096,22 +3117,49 @@ function ProductRow({
           <button className="bt-mini" onClick={onToggleExpand}>
             {expanded ? "Hide" : `${product.lines.length} order${product.lines.length === 1 ? "" : "s"}`}
           </button>
-          {editable && (
-            <button
-              className="bt-icon-btn"
-              disabled={busy}
-              aria-label={`Remove ${product.productTitle} from this run`}
-              onClick={() =>
-                onSubmit({
-                  intent: "remove-product",
-                  batchId: batch.id,
-                  batchProductId: product.id,
-                })
-              }
-            >
-              <IconX size={14} />
-            </button>
-          )}
+          {editable &&
+            (armedRemove?.kind === "product" ? (
+              /* Names what happens to the work, not just "are you sure" —
+                 the orders are not deleted, they go back to the pile. */
+              <span className="bt-confirm bt-confirm-sm">
+                <span>
+                  Remove
+                  {product.lines.length > 0
+                    ? ` — ${product.lines.length} order${product.lines.length === 1 ? "" : "s"} back to Untriaged`
+                    : ""}
+                  ?
+                </span>
+                <button
+                  className="bt-mini bt-danger"
+                  disabled={busy}
+                  onClick={() => {
+                    setArmedRemove(null);
+                    onSubmit({
+                      intent: "remove-product",
+                      batchId: batch.id,
+                      batchProductId: product.id,
+                    });
+                  }}
+                >
+                  Remove
+                </button>
+                <button
+                  className="bt-mini"
+                  onClick={() => setArmedRemove(null)}
+                >
+                  Keep
+                </button>
+              </span>
+            ) : (
+              <button
+                className="bt-icon-btn"
+                disabled={busy}
+                aria-label={`Remove ${product.productTitle} from this run`}
+                onClick={() => setArmedRemove({ kind: "product" })}
+              >
+                <IconX size={14} />
+              </button>
+            ))}
         </div>
       </div>
 
@@ -3387,22 +3435,48 @@ function ProductRow({
                   <span className="bt-line-due">
                     {formatPromisedDate(line.promisedDate) ?? ""}
                   </span>
-                  {editable && line.liveQuantity !== null && (
-                    <button
-                      className="bt-icon-btn"
-                      disabled={busy}
-                      aria-label={`Remove ${line.orderName}`}
-                      onClick={() =>
-                        onSubmit({
-                          intent: "remove-line",
-                          batchId: batch.id,
-                          lineItemId: line.lineItemId,
-                        })
-                      }
-                    >
-                      <IconX size={13} />
-                    </button>
-                  )}
+                  {editable &&
+                    line.liveQuantity !== null &&
+                    (armedRemove?.kind === "line" &&
+                    armedRemove.lineItemId === line.lineItemId ? (
+                      <span className="bt-confirm bt-confirm-sm">
+                        <span>Back to Untriaged?</span>
+                        <button
+                          className="bt-mini bt-danger"
+                          disabled={busy}
+                          onClick={() => {
+                            setArmedRemove(null);
+                            onSubmit({
+                              intent: "remove-line",
+                              batchId: batch.id,
+                              lineItemId: line.lineItemId,
+                            });
+                          }}
+                        >
+                          Remove
+                        </button>
+                        <button
+                          className="bt-mini"
+                          onClick={() => setArmedRemove(null)}
+                        >
+                          Keep
+                        </button>
+                      </span>
+                    ) : (
+                      <button
+                        className="bt-icon-btn"
+                        disabled={busy}
+                        aria-label={`Remove ${line.orderName} from this run`}
+                        onClick={() =>
+                          setArmedRemove({
+                            kind: "line",
+                            lineItemId: line.lineItemId,
+                          })
+                        }
+                      >
+                        <IconX size={13} />
+                      </button>
+                    ))}
                 </div>
               ))}
             </div>
@@ -3805,6 +3879,14 @@ const BATCH_CSS = `
   padding: 6px 6px 6px 12px;
 }
 .bt-confirm > span { font-size: 12px; color: #7c1405; }
+/* The inline form, sitting where an icon button was. Tighter padding and no
+   wrap, so arming a removal doesn't reflow the row underneath the cursor
+   that is about to confirm it. */
+.bt-confirm-sm {
+  flex-wrap: nowrap; padding: 3px 3px 3px 9px; gap: 6px;
+}
+.bt-confirm-sm > span { font-size: 11px; white-space: nowrap; }
+.bt-confirm-sm .bt-mini { padding: 4px 8px; }
 
 .bt-receipt {
   display: flex; align-items: center; gap: 6px; font-size: 12px; color: #14522c;
