@@ -508,6 +508,7 @@ export default function TrackPage() {
         l.variantTitle.toLowerCase().includes(q) ||
         l.orderName.toLowerCase().includes(q) ||
         (l.sku ?? "").toLowerCase().includes(q) ||
+        (l.batchName ?? "").toLowerCase().includes(q) ||
         (l.note ?? "").toLowerCase().includes(q)
       );
     });
@@ -747,7 +748,7 @@ export default function TrackPage() {
           <div className="tk-toolbar">
             <input
               className="input tk-search"
-              placeholder="Search product, variant, SKU, order or note…"
+              placeholder="Search product, variant, SKU, order, run or note…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
